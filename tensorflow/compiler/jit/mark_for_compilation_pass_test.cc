@@ -13,8 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tensorflow/compiler/jit/mark_for_compilation_pass_test_helper.h"
-
 #include "absl/container/flat_hash_map.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/match.h"
@@ -28,15 +26,16 @@ limitations under the License.
 #include "tensorflow/cc/ops/sendrecv_ops.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/compiler/jit/defs.h"
+#include "tensorflow/compiler/jit/mark_for_compilation_pass_test_helper.h"
 #include "tensorflow/compiler/jit/node_matchers.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
+#include "tensorflow/core/common_runtime/graph_def_builder_util.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/graph/algorithm.h"
-#include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/graph_def_builder.h"
-#include "tensorflow/core/graph/graph_def_builder_util.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
 
@@ -45,6 +44,11 @@ using ::tensorflow::testing::FindNodeByName;
 namespace tensorflow {
 namespace {
 
+static bool Initialized = [] {
+  tensorflow::GetXlaDeviceFlags()->tf_xla_enable_xla_devices = true;
+  return true;
+}();
+
 REGISTER_OP("UncompilableNullary").Output("o: float");
 REGISTER_OP("UncompilableUnary").Input("a: float").Output("o: float");
 
@@ -52,7 +56,7 @@ std::unordered_map<string, string> GetClusters(const Graph& graph) {
   std::unordered_map<string, string> ids;
   for (Node* node : graph.nodes()) {
     string cluster;
-    if (GetNodeAttr(node->attrs(), kXlaClusterAttr, &cluster).ok()) {
+    if (TryGetNodeAttr(node->attrs(), kXlaClusterAttr, &cluster)) {
       CHECK(!cluster.empty());
       ids[node->name()] = cluster;
     }
@@ -1718,5 +1722,120 @@ TEST(XlaCompilationTest, UnsupportedEnterExitPattern) {
   EXPECT_EQ(0, clusters.size());
 }
 
+namespace {
+Node* MakeStageNode(GraphDefBuilder& builder, string name,
+                    std::initializer_list<DataType> dtypes,
+                    absl::Span<const ops::NodeOut> values) {
+  auto opts = builder.opts()
+                  .WithName(std::move(name))
+                  .WithAttr("dtypes", std::move(dtypes));
+  if (opts.HaveError()) {
+    return nullptr;
+  }
+
+  NodeBuilder node_builder(name, "Stage", opts.op_registry());
+  node_builder.Input(values);
+  return opts.FinalizeBuilder(&node_builder);
+}
+}  // namespace
+
+TEST(XlaCompilationTest, StagePipelinePreservedByClusterScopingPass) {
+  auto build_staged_graph = [](std::unique_ptr<Graph>* graph) -> Status {
+    // Construct a graph as below with two pipeline stages and test that nodes
+    // in different stages will not be merged if ClusterScopingPass is on.
+    //
+    //       b
+    //       |
+    //       v
+    // a -> add0 -> relu0 -> stage
+    //
+    //             b
+    //             |
+    //             v
+    // unstage -> add1 -> relu1
+    GraphDefBuilder builder(GraphDefBuilder::kFailImmediately);
+    Node* a = ops::SourceOp("Const", builder.opts()
+                                         .WithName("a")
+                                         .WithAttr("dtype", DT_FLOAT)
+                                         .WithAttr("value", Tensor()));
+    Node* b = ops::SourceOp("Const", builder.opts()
+                                         .WithName("b")
+                                         .WithAttr("dtype", DT_FLOAT)
+                                         .WithAttr("value", Tensor()));
+    Node* unstage = ops::SourceOp(
+        "Unstage",
+        builder.opts().WithName("unstage").WithAttr("dtypes", {DT_FLOAT}));
+
+    Node* add0 = ops::BinaryOp("Add", a, b, builder.opts().WithName("add0"));
+    Node* add1 =
+        ops::BinaryOp("Add", unstage, b, builder.opts().WithName("add1"));
+    Node* relu0 = ops::UnaryOp("Relu", add0, builder.opts().WithName("relu0"));
+    ops::UnaryOp("Relu", add1, builder.opts().WithName("relu1"));
+    MakeStageNode(builder, "stage", {DT_FLOAT}, {relu0});
+
+    return GraphDefBuilderToGraph(builder, graph->get());
+  };
+
+  // All nodes go into the same cluster if ClusterScopingPass is off.
+  {
+    std::unique_ptr<Graph> graph(new Graph(OpRegistry::Global()));
+    TF_ASSERT_OK(build_staged_graph(&graph));
+
+    TF_ASSERT_OK(MarkForCompilationPassTestHelper::MarkForCompilation(
+        &graph,
+        MarkForCompilationPassTestHelper::Options().WithNoClusterScoping()));
+
+    std::unordered_map<string, string> clusters = GetClusters(*graph);
+    EXPECT_EQ(clusters["add0"], clusters["add1"]);
+    EXPECT_EQ(clusters["add0"], clusters["relu1"]);
+    EXPECT_EQ(clusters["relu0"], clusters["add1"]);
+    EXPECT_EQ(clusters["relu0"], clusters["relu1"]);
+  }
+
+  // By default, ClusterScopingPass is on and different pipeline stages should
+  // not be merged.
+  {
+    std::unique_ptr<Graph> graph(new Graph(OpRegistry::Global()));
+    TF_ASSERT_OK(build_staged_graph(&graph));
+
+    TF_ASSERT_OK(MarkForCompilationPassTestHelper::MarkForCompilation(&graph));
+
+    std::unordered_map<string, string> clusters = GetClusters(*graph);
+    EXPECT_NE(clusters["add0"], clusters["add1"]);
+    EXPECT_NE(clusters["add0"], clusters["relu1"]);
+    EXPECT_NE(clusters["relu0"], clusters["add1"]);
+    EXPECT_NE(clusters["relu0"], clusters["relu1"]);
+  }
+}
+TEST(XlaCompilationTest, XLALiteAllowlist) {
+  auto* allowlist_table = tensorflow::GetAllowlistTable();
+  absl::flat_hash_set<string> hallowlist;
+  std::vector<string> vall_ops = XlaOpRegistry::GetAllRegisteredOps();
+  absl::flat_hash_set<string> all_ops(vall_ops.begin(), vall_ops.end());
+
+  // Check that all the operations in the table are existing TF operations
+  for (auto pair : *allowlist_table) {
+    hallowlist.insert(pair.second.begin(), pair.second.end());
+    for (auto op : pair.second) {
+      ASSERT_TRUE(all_ops.contains(op));
+    }
+  }
+
+  // Check that all registered XLA operation are in the allowlist
+  // table or are known to not be in it.
+
+  absl::flat_hash_set<string> known_not_in_list =
+      tensorflow::testing::GetKnownXLAAllowlistOp();
+  std::vector<string> unknow_op;
+  for (string op : vall_ops) {
+    if (!hallowlist.contains(op) && !known_not_in_list.contains(op)) {
+      unknow_op.push_back(op);
+    }
+  }
+  EXPECT_TRUE(unknow_op.empty())
+      << "Someone added support for a new TF opeations inside XLA. They must "
+         "be included in the XLALite allowlist or denylist:\n"
+      << absl::StrJoin(unknow_op, "\n");
+}
 }  // namespace
 }  // namespace tensorflow

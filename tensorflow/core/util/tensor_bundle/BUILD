@@ -1,13 +1,20 @@
 # Description:
 #   Tensor bundle: a module to efficiently serialize and deserialize tensors.
 
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
 load(
     "//tensorflow:tensorflow.bzl",
-    "cc_header_only_library",
     "if_not_windows",
+    "if_windows",
     "tf_cc_test",
     "tf_copts",
 )
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "cc_header_only_library")
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "filegroup")
 
 package(
     default_visibility = ["//visibility:public"],
@@ -18,6 +25,8 @@ package(
 filegroup(
     name = "mobile_srcs",
     srcs = [
+        "byte_swap.cc",
+        "byte_swap.h",
         "naming.cc",
         "naming.h",
         "tensor_bundle.cc",
@@ -32,9 +41,16 @@ alias(
 
 cc_library(
     name = "tensor_bundle",
-    srcs = ["tensor_bundle.cc"],
-    hdrs = ["tensor_bundle.h"],
+    srcs = [
+        "byte_swap.cc",
+        "tensor_bundle.cc",
+    ],
+    hdrs = [
+        "byte_swap.h",
+        "tensor_bundle.h",
+    ],
     copts = tf_copts() + if_not_windows(["-Wno-sign-compare"]),
+    linkopts = if_windows(["-DEFAULTLIB:ws2_32.lib"]),
     deps = [
         ":naming",
         "//tensorflow/core:core_cpu_lib",
@@ -42,7 +58,6 @@ cc_library(
         "//tensorflow/core:framework_internal",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
-        "//tensorflow/core:proto_text",
         "//tensorflow/core:protos_all_cc",
     ],
 )
@@ -63,7 +78,7 @@ cc_library(
 tf_cc_test(
     name = "tensor_bundle_test",
     srcs = ["tensor_bundle_test.cc"],
-    data = glob(["testdata/**"]),
+    data = ["//tensorflow/core/util/tensor_bundle/testdata:old_string_tensors"],
     tags = [
         "nomsan",
         "notsan",

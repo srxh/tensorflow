@@ -18,10 +18,10 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "tensorflow/core/common_runtime/device.h"
+#include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/process_util.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/notification.h"
-#include "tensorflow/core/util/device_name_utils.h"
 
 namespace tensorflow {
 
@@ -121,9 +121,8 @@ void BufRendezvous::ConsumeBuf(const string& key, const string& device_name,
                                const ConsumerCallback& done) {
   // Check the incarnation in the request matches the current device
   // incarnation of the producer.
-  string local_device_name = DeviceNameUtils::LocalName(device_name);
   Device* device;
-  Status consumebuf_status = dev_mgr_->LookupDevice(local_device_name, &device);
+  Status consumebuf_status = dev_mgr_->LookupDevice(device_name, &device);
   if (consumebuf_status.ok() &&
       device->attributes().incarnation() != device_incarnation) {
     consumebuf_status = errors::FailedPrecondition(
@@ -185,7 +184,7 @@ void BufRendezvous::LogContents() {
   LOG(INFO) << strings::StrCat("BufRendezvous ",
                                strings::Hex(reinterpret_cast<uint64>(this)),
                                " step_id=", step_id_, " current contents:");
-  for (auto it : hook_table_) {
+  for (const auto& it : hook_table_) {
     LOG(INFO) << it.first << ":" << it.second->DebugString();
   }
 }

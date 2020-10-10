@@ -44,8 +44,8 @@ SliceIndex HandleCopies(OpKernelContext* ctx,
   const SliceIndex indices_size = static_cast<SliceIndex>(indices.dimension(0));
   const SliceIndex batch_size = static_cast<SliceIndex>(params.dimension(0));
   const Index limit = static_cast<Index>(params.dimension(1));
-  T* out_base = &out(0, 0, 0);
-  const T* params_base = &params(0, 0, 0);
+  T* out_base = out.data();
+  const T* params_base = params.data();
   if (static_slice_elems >= 0) {
     // Give compiler static knowledge of the number of elements/bytes
     slice_elems = static_slice_elems;
@@ -97,7 +97,8 @@ SliceIndex HandleCopies(OpKernelContext* ctx,
             slice_bytes);
       } else {
         // For non-"simple" types (e.g. strings).
-        out.template chip<1>(indices_idx) = params.template chip<1>(index);
+        out.template chip<0>(batch_idx).template chip<0>(indices_idx) =
+            params.template chip<0>(batch_idx).template chip<0>(index);
       }
       indices_idx = i_next;
       batch_idx = b_next;

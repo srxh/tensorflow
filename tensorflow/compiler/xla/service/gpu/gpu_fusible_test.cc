@@ -91,6 +91,44 @@ TEST_F(GpuFusibleTest,
       LayoutsAreReduceInputFusionFriendly(*loop_fusion, *reduce_fusion));
 }
 
+TEST_F(GpuFusibleTest,
+       LayoutsAreReduceInputFusionFriendly_MixedLayoutProducerWithTrivialDim) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    mixed_input_layouts_computation {
+      p0.1 = f16[128,1,32,32]{1,3,2,0} parameter(0)
+      p1.1 = f16[128,1,32,32]{3,2,1,0} parameter(1)
+      copy = f16[128,1,32,32]{1,3,2,0} copy(p1.1)
+      c0 = f16[] constant(0)
+      broadcast = f16[128,1,32,32]{1,3,2,0} broadcast(c0), dimensions={}
+      greater-than = pred[128,1,32,32]{1,3,2,0} compare(copy, broadcast), direction=GT
+      ROOT root = f16[128,1,32,32]{1,3,2,0} select(greater-than, p0.1, broadcast)
+    }
+    fused_reduce {
+      p0.2 = f16[128,1,32,32]{1,3,2,0} parameter(0)
+      convert = f32[128,1,32,32]{1,3,2,0} convert(p0.2)
+      c0.2 = f32[] constant(0)
+      ROOT reduce = f32[1]{0} reduce(convert, c0.2), dimensions={0,2,3}, to_apply=scalar_add
+    }
+    ENTRY entry {
+      p0 = f16[128,1,32,32]{1,3,2,0} parameter(0)
+      p1 = f16[128,1,32,32]{3,2,1,0} parameter(1)
+      loop_fusion = f16[128,1,32,32]{1,3,2,0} fusion(p0, p1), kind=kLoop, calls=mixed_input_layouts_computation
+      reduce_fusion = f32[1]{0} fusion(loop_fusion), kind=kInput, calls=fused_reduce
+      ROOT root = (f32[1]{0}, f16[128,1,32,32]{1,3,2,0}) tuple(reduce_fusion, loop_fusion)
+    })"))
+                    .ValueOrDie();
+  SCOPED_TRACE(module->ToString());
+  const HloInstruction* reduce_fusion =
+      module->entry_computation()->root_instruction()->operand(0);
+  ASSERT_EQ(reduce_fusion->fused_expression_root()->opcode(),
+            HloOpcode::kReduce);
+  const HloInstruction* loop_fusion =
+      module->entry_computation()->root_instruction()->operand(1);
+  ASSERT_EQ(loop_fusion->fused_expression_root()->opcode(), HloOpcode::kSelect);
+  EXPECT_TRUE(
+      LayoutsAreReduceInputFusionFriendly(*loop_fusion, *reduce_fusion));
+}
+
 TEST_F(GpuFusibleTest, LayoutsAreReduceInputFusionFriendly_CopyProducer) {
   auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
     fused_reduce {
@@ -152,17 +190,18 @@ TEST_F(GpuFusibleTest,
 }
 
 TEST_F(GpuFusibleTest,
-       LayoutsAreReduceInputFusionFriendly_ConsiderMaximumRanksParamsOnly) {
+       LayoutsAreReduceInputFusionFriendly_ConsiderMaximumTrueRanksParamsOnly) {
   auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
     broadcasting_computation {
       p0.1 = f32[128,1024,32,32]{1,3,2,0} parameter(0)
-      p1.1 = f32[128]{0} parameter(1)
-      broadcast = f32[128,1024,32,32]{1,3,2,0} broadcast(p1.1), dimensions={0}
+      p1.1 = f32[1,128,1,1]{3,2,1,0} parameter(1)
+      reshape = f32[128]{0} reshape(p1.1)
+      broadcast = f32[128,1024,32,32]{1,3,2,0} broadcast(reshape), dimensions={0}
       ROOT add = f32[128,1024,32,32]{1,3,2,0} add(p0.1, broadcast)
     }
     ENTRY entry {
       p0 = f32[128,1024,32,32]{1,3,2,0} parameter(0)
-      p1 = f32[128]{0} parameter(1)
+      p1 = f32[1,128,1,1]{3,2,1,0} parameter(1)
       loop_fusion = f32[128,1024,32,32]{1,3,2,0} fusion(p0, p1), kind=kLoop, calls=broadcasting_computation
       c0.2 = f32[] constant(0)
       ROOT reduce = f32[1024]{0} reduce(loop_fusion, c0.2), dimensions={0,2,3}, to_apply=scalar_add
@@ -380,8 +419,8 @@ TEST_F(GpuFusibleTest, ShapesCompatibleForMultiOutputFusion_IgnoreFpPrecision) {
     ENTRY entry {
       p0 = f32[6400]{0} parameter(0)
       fusion.1 = f32[6400]{0} fusion(p0), kind=kLoop, calls=fused_computation_1
-      fusion.2 = f32[6400]{0} fusion(p0), kind=kLoop, calls=fused_computation_2
-      ROOT root = (f32[6400]{0}, f32[6400]{0}) tuple(fusion.1, fusion.2)
+      fusion.2 = f16[6400]{0} fusion(p0), kind=kLoop, calls=fused_computation_2
+      ROOT root = (f32[6400]{0}, f16[6400]{0}) tuple(fusion.1, fusion.2)
     })"))
                     .ValueOrDie();
   const HloInstruction* fusion_1 =
@@ -465,7 +504,43 @@ TEST_F(GpuFusibleTest,
   const HloInstruction* fusion_1 =
       module->entry_computation()->root_instruction()->operand(0)->operand(0);
   const HloInstruction* fusion_2 =
-      module->entry_computation()->root_instruction()->operand(1)->operand(0);
+      module->entry_computation()->root_instruction()->operand(2);
+  EXPECT_NE(fusion_1, fusion_2);
+  EXPECT_TRUE(ShapesCompatibleForMultiOutputFusion(*fusion_1, *fusion_2));
+}
+
+TEST_F(GpuFusibleTest,
+       ShapesCompatibleForMultiOutputFusion_DifferentElementType) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    fused_computation_1 {
+      p0.1 = f32[8,1,5,16,1,1]{5,4,3,2,1,0} parameter(0)
+      mul = f32[8,1,5,16,1,1]{5,4,3,2,1,0} multiply(p0.1, p0.1)
+      exp = f32[8,1,5,16,1,1]{5,4,3,2,1,0} exponential(p0.1)
+      ROOT tuple = (f32[8,1,5,16,1,1]{5,4,3,2,1,0}, f32[8,1,5,16,1,1]{5,4,3,2,1,0}) tuple(mul, exp)
+    }
+
+    fused_computation_2 {
+      p0.2 = f32[8,1,5,16,1,1]{5,4,3,2,1,0} parameter(0)
+      const.2 = f32[] constant(0)
+      broadcast = f32[8,1,5,16,1,1]{5,4,3,2,1,0} broadcast(const.2), dimensions={}
+      add = f32[8,1,5,16,1,1]{5,4,3,2,1,0} add(p0.2, broadcast)
+      ROOT convert = s32[8,1,5,16,1,1]{5,4,3,2,1,0} convert(add)
+    }
+
+    ENTRY entry {
+      p0 = f32[8,1,5,16,1,1]{5,4,3,2,1,0} parameter(0)
+      fusion.1 = (f32[8,1,5,16,1,1]{5,4,3,2,1,0}, f32[8,1,5,16,1,1]{5,4,3,2,1,0}) fusion(p0), kind=kLoop, calls=fused_computation_1
+      fusion.2 = s32[8,1,5,16,1,1]{5,4,3,2,1,0} fusion(p0), kind=kLoop, calls=fused_computation_2
+      gte0 = f32[8,1,5,16,1,1]{5,4,3,2,1,0} get-tuple-element(fusion.1), index=0
+      gte1 = f32[8,1,5,16,1,1]{5,4,3,2,1,0} get-tuple-element(fusion.1), index=1
+      ROOT root = (f32[8,1,5,16,1,1]{5,4,3,2,1,0}, f32[8,1,5,16,1,1]{5,4,3,2,1,0}, f32[8,1,5,16,1,1]{5,4,3,2,1,0}) tuple(gte0, gte1, fusion.2)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* fusion_1 =
+      module->entry_computation()->root_instruction()->operand(0)->operand(0);
+  const HloInstruction* fusion_2 =
+      module->entry_computation()->root_instruction()->operand(2);
+  EXPECT_NE(fusion_1, fusion_2);
   EXPECT_TRUE(ShapesCompatibleForMultiOutputFusion(*fusion_1, *fusion_2));
 }
 
@@ -633,7 +708,7 @@ TEST_F(GpuFusibleTest,
       p1 = f32[32,32,32]{2,1,0} parameter(1)
       element_wise = f32[32,32,32]{2,1,0} fusion(p0, p1), kind=kLoop,
         calls=fused_element_wise
-      fusion = (f32[32,32]{1,0}, f32[32,32]{1,0}) fusion(element_wise),
+      fusion = f32[32,32]{1,0} fusion(element_wise),
         kind=kLoop, calls=fused_reduce
       ROOT root = (f32[32,32]{1,0}, f32[32,32,32]{2,1,0})
         tuple(fusion, element_wise)
@@ -794,7 +869,7 @@ TEST_F(GpuFusibleTest, ProducerConsumerFusionDoNotFuseLoopReduceFusion) {
       p0 = f32[2,2,2]{2,1,0} parameter(0)
       p1 = f32[2,2,2]{2,1,0} parameter(1)
       element_wise = f32[2,2,2]{2,1,0} fusion(p0, p1), kind=kLoop, calls=fused_element_wise
-      fusion = (f32[2,2]{1,0}, f32[2,2]{1,0}) fusion(element_wise), kind=kLoop, calls=fused_reduce
+      fusion = f32[2,2]{1,0} fusion(element_wise), kind=kLoop, calls=fused_reduce
       ROOT root = (f32[2,2]{1,0}, f32[2,2,2]{2,1,0}) tuple(fusion, element_wise)
     })"))
                     .ValueOrDie();
@@ -904,6 +979,137 @@ TEST_F(GpuFusibleTest, FuseLayoutChangingOpWithElementwise) {
       module->entry_computation()->root_instruction();
   const HloInstruction* producer = consumer->operand(0);
   EXPECT_TRUE(IsProducerConsumerFusible(*producer, *consumer));
+}
+
+TEST_F(GpuFusibleTest, CreatesNestedLoop_NonfusionInstr) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    ENTRY entry {
+      p_0 = f32[2,5] parameter(0)
+
+      constant_1 = f32[] constant(1)
+      reduce-window_1 = f32[3,5] reduce-window(p_0, constant_1),
+        window={size=2x1 pad=0_2x0_0}, to_apply=scalar_add
+
+      constant_2 = f32[] constant(2)
+      reduce-window_2 = f32[3,5] reduce-window(p_0, constant_2),
+        window={size=2x1 pad=0_2x0_0}, to_apply=scalar_add
+
+      ROOT root = (f32[32,32], f32[32,32,32]) tuple(reduce-window_1, reduce-window_2)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  const HloInstruction* producer = root->operand(0);
+  const HloInstruction* consumer = root->operand(1);
+  EXPECT_TRUE(CreatesNestedLoop(*producer, *consumer));
+}
+
+TEST_F(GpuFusibleTest, DoesNotCreateNestedLoop_NonfusionInstr) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    ENTRY entry {
+      p_0 = f32[3,5] parameter(0)
+      constant = f32[] constant(1)
+      broadcast = f32[3, 5] broadcast(f32[] constant), dimensions={}
+      scaled_p_0 = f32[3,5] multiply(f32[3, 5] broadcast, f32[3,5]{1, 0} p_0)
+
+      p_1 = f32[2,5] parameter(1)
+      reduce-window = f32[3,5] reduce-window(p_1, constant),
+        window={size=2x1 pad=0_2x0_0}, to_apply=scalar_add
+
+      ROOT root = (f32[32,32], f32[32,32,32]) tuple(reduce-window, scaled_p_0)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  const HloInstruction* producer = root->operand(0);
+  const HloInstruction* consumer = root->operand(1);
+  EXPECT_FALSE(CreatesNestedLoop(*producer, *consumer));
+}
+
+TEST_F(GpuFusibleTest, DoesNotCreateNestedLoop_NonoverlappingReduceWindows) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    ENTRY entry {
+      p_0 = f32[2,5] parameter(0)
+
+      constant_1 = f32[] constant(1)
+      reduce-window_1 = f32[3,5] reduce-window(p_0, constant_1),
+        window={size=2x1 pad=0_2x0_0}, to_apply=scalar_add
+
+      constant_2 = f32[] constant(2)
+      reduce-window_2 = f32[2,3] reduce-window(p_0, constant_2),
+        window={size=2x1 pad=0_2x0_0 stride=2x2}, to_apply=scalar_add
+
+      ROOT root = (f32[32,32], f32[32,32,32]) tuple(reduce-window_1, reduce-window_2)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  const HloInstruction* producer = root->operand(0);
+  const HloInstruction* consumer = root->operand(1);
+  EXPECT_FALSE(CreatesNestedLoop(*producer, *consumer));
+}
+
+TEST_F(GpuFusibleTest, CreatesNestedLoop_FusionInstr) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    fused_producer {
+      operand = f32[2,2] parameter(0)
+      constant = f32[] constant(1)
+      ROOT reduce-window = f32[2,2] reduce-window(operand, constant),
+        window={size=2x2 pad=0_1x0_1}, to_apply=scalar_add
+    }
+
+    fused_consumer {
+      operand_0 = f32[2,2] parameter(0)
+
+      operand_1 = f32[2,2] parameter(1)
+      constant = f32[] constant(1)
+      reduce-window = f32[2,2] reduce-window(operand_1, constant),
+        window={size=2x2 pad=0_1x0_1}, to_apply=scalar_add
+
+      ROOT scaled_operand_1 = f32[2,2] multiply(f32[2, 2] operand_0, f32[2,2] reduce-window)
+    }
+
+    ENTRY entry {
+      p0 = f32[2,2] parameter(0)
+      producer = f32[2,2] fusion(p0), kind=kLoop, calls=fused_producer
+      consumer = f32[2,2] fusion(p0, producer), kind=kLoop, calls=fused_consumer
+      ROOT root = (f32[2,2], f32[2,2]) tuple(producer, consumer)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  const HloInstruction* producer = root->operand(0);
+  const HloInstruction* consumer = root->operand(1);
+  EXPECT_TRUE(CreatesNestedLoop(*producer, *consumer));
+}
+
+TEST_F(GpuFusibleTest, DoesNotCreateNestedLoop_FusionInstr) {
+  auto module = ParseAndReturnVerifiedModule(absl::StrCat(kModulePrefix, R"(
+    fused_producer {
+      p_0 = f32[2,2] parameter(0)
+      constant = f32[] constant(1)
+      ROOT reduce-window = f32[2,2] reduce-window(p_0, constant),
+        window={size=2x2 pad=0_1x0_1}, to_apply=scalar_add
+    }
+
+    fused_consumer {
+      p_0 = f32[2,2] parameter(0)
+
+      p_1 = f32[2,2] parameter(1)
+      constant = f32[] constant(1)
+      reduce-window = f32[2,2] reduce-window(p_1, constant),
+        window={size=2x2 pad=0_1x0_1}, to_apply=scalar_add
+
+      ROOT scaled_p_1 = f32[2,2] multiply(f32[2, 2] p_0, f32[2,2] reduce-window)
+    }
+
+    ENTRY entry {
+      p_0 = f32[2,2] parameter(0)
+      producer = f32[2,2] fusion(p_0), kind=kLoop, calls=fused_producer
+      consumer = f32[2,2] fusion(producer, p_0), kind=kLoop, calls=fused_consumer
+      ROOT root = (f32[2,2], f32[2,2]) tuple(producer, consumer)
+    })"))
+                    .ValueOrDie();
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  const HloInstruction* producer = root->operand(0);
+  const HloInstruction* consumer = root->operand(1);
+  EXPECT_FALSE(CreatesNestedLoop(*producer, *consumer));
 }
 
 }  // namespace gpu

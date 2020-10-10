@@ -65,9 +65,26 @@ class AsStringOp : public OpKernel {
     OP_REQUIRES(ctx, !(scientific && shortest),
                 errors::InvalidArgument(
                     "Cannot select both scientific and shortest notation"));
+
     format_ = "%";
+    if (!fill_string.empty()) {
+      switch (fill_string[0]) {
+        case ' ':
+        case '+':
+        case '-':
+        case '0':
+        case '#':
+          strings::Appendf(&format_, "%s", fill_string.c_str());
+          break;
+        default:
+          bool fill_not_supported = true;
+          OP_REQUIRES(ctx, !fill_not_supported,
+                      errors::InvalidArgument("Fill argument not supported: \"",
+                                              fill_string, "\""));
+      }
+    }
     if (width > -1) {
-      strings::Appendf(&format_, "%s%d", fill_string.c_str(), width);
+      strings::Appendf(&format_, "%d", width);
     }
     if (precision > -1) {
       strings::Appendf(&format_, ".%d", precision);
@@ -116,7 +133,7 @@ class AsStringOp : public OpKernel {
     OP_REQUIRES_OK(context,
                    context->allocate_output("output", input_tensor->shape(),
                                             &output_tensor));
-    auto output_flat = output_tensor->flat<string>();
+    auto output_flat = output_tensor->flat<tstring>();
 
 #define ENCODE_TYPE(type, T, enc_str)                                     \
   case (type): {                                                          \

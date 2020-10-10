@@ -40,16 +40,12 @@ class GpuElementalIrEmitter : public ElementalIrEmitter {
  public:
   // A NestedComputer computes an element of the output of the given computation
   // given a Span of its input elements.
-  using NestedComputer = std::function<StatusOr<llvm::Value*>(
+  using NestedComputer = std::function<StatusOr<std::vector<llvm::Value*>>(
       const HloComputation&, absl::Span<llvm::Value* const>)>;
 
   GpuElementalIrEmitter(const HloModuleConfig& hlo_module_config,
                         llvm::Module* module, llvm::IRBuilder<>* b,
                         NestedComputer compute_nested);
-
-  llvm_ir::ElementGenerator MakeElementGenerator(
-      const HloInstruction* hlo,
-      const HloToElementGeneratorMap& operand_to_generator) override;
 
  protected:
   StatusOr<llvm::Value*> EmitFloatBinaryOp(const HloInstruction* op,
@@ -89,20 +85,26 @@ class GpuElementalIrEmitter : public ElementalIrEmitter {
   StatusOr<llvm::Value*> EmitTanh(PrimitiveType prim_type,
                                   llvm::Value* value) override;
 
+  StatusOr<llvm::Value*> EmitComplexAbs(PrimitiveType prim_type,
+                                        llvm::Value* value) override;
+
+  StatusOr<std::vector<llvm::Value*>> EmitThreadLocalCall(
+      const HloComputation& callee, absl::Span<llvm::Value* const> parameters,
+      absl::string_view) override {
+    return compute_nested_(callee, parameters);
+  }
+
   llvm::Value* EmitThreadId() override;
+
+  bool fast_min_max() override {
+    return hlo_module_config_.debug_options().xla_gpu_enable_fast_min_max();
+  }
 
  private:
   // Emits IR for op, which must have opcode kPower.
   StatusOr<llvm::Value*> EmitPowerOp(const HloInstruction* op,
                                      llvm::Value* lhs_value,
                                      llvm::Value* rhs_value);
-
-  // Emits IR to call a device function named "callee_name" on the given
-  // operand. Returns the IR value that represents the return value.
-  llvm::Value* EmitDeviceFunctionCall(
-      const string& callee_name, absl::Span<llvm::Value* const> operands,
-      absl::Span<const PrimitiveType> input_type, PrimitiveType output_type,
-      absl::Span<const llvm::Attribute::AttrKind> attributes);
 
   // Emits IR to call an LLVM intrinsic of type [T] -> T.  Adjusts
   // callee_name according to T.  Returns the IR value that represents the

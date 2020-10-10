@@ -109,21 +109,23 @@ TEST_F(InstructionFusionTest,
   EXPECT_THAT(computation->root_instruction(), op::Fusion());
 }
 
-TEST_F(InstructionFusionTest, PotentialBitcastReshapeOfDotUnfused) {
+TEST_F(InstructionFusionTest, PotentialBitcastReshapeOfDotFused) {
   HloComputation::Builder builder(TestName());
   auto param0 = builder.AddInstruction(HloInstruction::CreateParameter(
-      0, ShapeUtil::MakeShape(S32, {1, 1}), "0"));
+      0, ShapeUtil::MakeShape(F32, {1, 1}), "0"));
   auto dot1 = builder.AddInstruction(
-      CreateCanonicalDot(ShapeUtil::MakeShape(S32, {1, 1}), param0, param0));
+      CreateCanonicalDot(ShapeUtil::MakeShape(F32, {1, 1}), param0, param0));
   auto reshape2 = builder.AddInstruction(HloInstruction::CreateReshape(
-      ShapeUtil::MakeShape(S32, {1, 1, 1}), dot1));
+      ShapeUtil::MakeShape(F32, {1, 1, 1}), dot1));
+  auto log = builder.AddInstruction(HloInstruction::CreateUnary(
+      reshape2->shape(), xla::HloOpcode::kLog, reshape2));
 
   auto module = CreateNewVerifiedModule();
   auto computation = module->AddEntryComputation(builder.Build());
-  EXPECT_EQ(reshape2, computation->root_instruction());
-  EXPECT_FALSE(GpuInstructionFusion(/*may_duplicate=*/true)
-                   .Run(module.get())
-                   .ValueOrDie());
+  EXPECT_EQ(log, computation->root_instruction());
+  EXPECT_TRUE(GpuInstructionFusion(/*may_duplicate=*/true)
+                  .Run(module.get())
+                  .ValueOrDie());
 }
 
 TEST_F(InstructionFusionTest, PotentialBitcastTransposeOfDotUnfused) {
@@ -579,6 +581,63 @@ TEST_F(InstructionFusionTest, FuseReverse) {
   EXPECT_THAT(root, op::Fusion());
   EXPECT_THAT(root->fused_expression_root(),
               op::Reverse(op::Add(op::Parameter(), op::Parameter())));
+}
+
+TEST_F(InstructionFusionTest, GpuIsExpensiveF32) {
+  auto m = CreateNewVerifiedModule();
+  Shape r0f32 = ShapeUtil::MakeShape(F32, {});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r0f32, "param0"));
+
+  HloInstruction* one = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
+  HloInstruction* div = builder.AddInstruction(
+      HloInstruction::CreateBinary(r0f32, HloOpcode::kDivide, param0, one));
+  HloInstruction* rem = builder.AddInstruction(
+      HloInstruction::CreateBinary(r0f32, HloOpcode::kRemainder, param0, one));
+
+  EXPECT_FALSE(GpuInstructionFusion::IsExpensive(*div));
+  EXPECT_TRUE(GpuInstructionFusion::IsExpensive(*rem));
+}
+
+TEST_F(InstructionFusionTest, GpuIsExpensiveS32) {
+  auto m = CreateNewVerifiedModule();
+  Shape r0s32 = ShapeUtil::MakeShape(S32, {});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r0s32, "param0"));
+
+  HloInstruction* one = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
+  HloInstruction* div = builder.AddInstruction(
+      HloInstruction::CreateBinary(r0s32, HloOpcode::kDivide, param0, one));
+  HloInstruction* rem = builder.AddInstruction(
+      HloInstruction::CreateBinary(r0s32, HloOpcode::kRemainder, param0, one));
+
+  EXPECT_FALSE(GpuInstructionFusion::IsExpensive(*div));
+  EXPECT_FALSE(GpuInstructionFusion::IsExpensive(*rem));
+}
+
+TEST_F(InstructionFusionTest, GpuIsExpensiveBroadcastS32) {
+  auto m = CreateNewVerifiedModule();
+  Shape r1s32 = ShapeUtil::MakeShape(S32, {10});
+  HloComputation::Builder builder(TestName());
+  HloInstruction* param0 = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, r1s32, "param0"));
+
+  HloInstruction* one = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0f)));
+  HloInstruction* one_broad =
+      builder.AddInstruction(HloInstruction::CreateBroadcast(r1s32, one, {}));
+
+  HloInstruction* div = builder.AddInstruction(HloInstruction::CreateBinary(
+      r1s32, HloOpcode::kDivide, param0, one_broad));
+  HloInstruction* rem = builder.AddInstruction(HloInstruction::CreateBinary(
+      r1s32, HloOpcode::kRemainder, param0, one_broad));
+
+  EXPECT_FALSE(GpuInstructionFusion::IsExpensive(*div));
+  EXPECT_FALSE(GpuInstructionFusion::IsExpensive(*rem));
 }
 
 }  // namespace gpu

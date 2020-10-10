@@ -200,7 +200,7 @@ class RNNTest(test.TestCase):
   def testInvalidSequenceLengthShape(self):
     cell = Plus1RNNCell()
     inputs = [array_ops.placeholder(dtypes.float32, shape=(3, 4))]
-    with self.assertRaisesRegexp(ValueError, "must be a vector"):
+    with self.assertRaisesRegex(ValueError, "must be a vector"):
       rnn.static_rnn(cell, inputs, dtype=dtypes.float32, sequence_length=4)
 
   @test_util.run_v1_only("b/124229375")
@@ -1014,11 +1014,14 @@ class LSTMTest(test.TestCase):
                 inputs[0]: input_value
             })
 
+      comparison_fn = self.assertAllEqual
+      if test_util.is_xla_enabled():
+        comparison_fn = self.assertAllClose
       if in_graph_mode:
-        self.assertAllEqual(outputs_static, outputs_dynamic)
+        comparison_fn(outputs_static, outputs_dynamic)
       else:
         self.assertAllEqual(array_ops.stack(outputs_static), outputs_dynamic)
-      self.assertAllEqual(np.hstack(state_static), np.hstack(state_dynamic))
+      comparison_fn(np.hstack(state_static), np.hstack(state_dynamic))
 
   @test_util.run_in_graph_and_eager_modes
   def testDynamicRNNWithNestedTupleStates(self):
@@ -1101,13 +1104,16 @@ class LSTMTest(test.TestCase):
                 inputs[0]: input_value
             })
 
+      comparison_fn = self.assertAllEqual
+      if test_util.is_xla_enabled():
+        comparison_fn = self.assertAllClose
       if in_graph_mode:
-        self.assertAllEqual(outputs_static, outputs_dynamic)
+        comparison_fn(outputs_static, outputs_dynamic)
       else:
         self.assertAllEqual(array_ops.stack(outputs_static), outputs_dynamic)
         state_static = nest.flatten(state_static)
         state_dynamic = nest.flatten(state_dynamic)
-      self.assertAllEqual(np.hstack(state_static), np.hstack(state_dynamic))
+      comparison_fn(np.hstack(state_static), np.hstack(state_dynamic))
 
   def _testDynamicEquivalentToStaticRNN(self, use_sequence_length):
     time_steps = 8
@@ -1164,10 +1170,6 @@ class LSTMTest(test.TestCase):
             cell, inputs, sequence_length=sequence_length, dtype=dtypes.float32)
 
       if in_graph_mode:
-        # Generate gradients and run sessions to obtain outputs
-        feeds = {concat_inputs: input_values}
-        # Initialize
-        variables_lib.global_variables_initializer().run(feed_dict=feeds)
         # Generate gradients of sum of outputs w.r.t. inputs
         static_gradients = gradients_impl.gradients(
             outputs_static + [state_static], [concat_inputs])
@@ -1186,6 +1188,10 @@ class LSTMTest(test.TestCase):
             gradients_impl.gradients(y, trainable_variables)
             for y in [outputs_static[0], outputs_static[-1], state_static]
         ])
+        # Generate gradients and run sessions to obtain outputs
+        feeds = {concat_inputs: input_values}
+        # Initialize
+        variables_lib.global_variables_initializer().run(feed_dict=feeds)
         # Test forward pass
         values_static = sess.run(outputs_static, feed_dict=feeds)
         (state_value_static,) = sess.run((state_static,), feed_dict=feeds)
@@ -1229,10 +1235,6 @@ class LSTMTest(test.TestCase):
         split_outputs_dynamic = array_ops.unstack(outputs_dynamic, time_steps)
 
       if in_graph_mode:
-        feeds = {concat_inputs: input_values}
-
-        # Initialize
-        variables_lib.global_variables_initializer().run(feed_dict=feeds)
 
         # Generate gradients of sum of outputs w.r.t. inputs
         dynamic_gradients = gradients_impl.gradients(
@@ -1259,6 +1261,11 @@ class LSTMTest(test.TestCase):
                 state_dynamic
             ]
         ])
+
+        feeds = {concat_inputs: input_values}
+
+        # Initialize
+        variables_lib.global_variables_initializer().run(feed_dict=feeds)
 
         # Test forward pass
         values_dynamic = sess.run(split_outputs_dynamic, feed_dict=feeds)
@@ -2190,7 +2197,7 @@ class RawRNNTest(test.TestCase):
 
       r = rnn.raw_rnn(cell, loop_fn)
       loop_state = r[-1]
-      self.assertEqual([10], loop_state.eval())
+      self.assertEqual([10], self.evaluate(loop_state))
 
   @test_util.run_v1_only("b/124229375")
   def testLoopStateWithTensorArray(self):
@@ -2234,7 +2241,7 @@ class RawRNNTest(test.TestCase):
       r = rnn.raw_rnn(cell, loop_fn)
       loop_state = r[-1]
       loop_state = loop_state.stack()
-      self.assertAllEqual([1, 2, 2 + 2, 4 + 3, 7 + 4], loop_state.eval())
+      self.assertAllEqual([1, 2, 2 + 2, 4 + 3, 7 + 4], loop_state)
 
   @test_util.run_v1_only("b/124229375")
   def testEmitDifferentStructureThanCellOutput(self):
@@ -2789,10 +2796,9 @@ class RNNCellTest(test.TestCase, parameterized.TestCase):
             state_is_tuple=False)
         cell(x, m)  # Execute to create variables
       variables = variables_lib.global_variables()
-      self.assertEquals(variables[0].op.name, "root/lstm_cell/kernel")
-      self.assertEquals(variables[1].op.name, "root/lstm_cell/bias")
-      self.assertEquals(variables[2].op.name,
-                        "root/lstm_cell/projection/kernel")
+      self.assertEqual(variables[0].op.name, "root/lstm_cell/kernel")
+      self.assertEqual(variables[1].op.name, "root/lstm_cell/bias")
+      self.assertEqual(variables[2].op.name, "root/lstm_cell/projection/kernel")
 
   @test_util.run_in_graph_and_eager_modes
   def testWrapperCheckpointing(self):
@@ -2943,7 +2949,7 @@ class RNNCellTest(test.TestCase, parameterized.TestCase):
         m_good = (array_ops.zeros([1, 2]), array_ops.zeros([1, 2]))
 
         # Test incorrectness of state
-        with self.assertRaisesRegexp(ValueError, "Expected state .* a tuple"):
+        with self.assertRaisesRegex(ValueError, "Expected state .* a tuple"):
           rnn_cell_impl.MultiRNNCell(
               [rnn_cell_impl.GRUCell(2) for _ in range(2)],
               state_is_tuple=True)(x, m_bad)
@@ -3056,6 +3062,8 @@ class RNNCellTest(test.TestCase, parameterized.TestCase):
 
 
 @test_util.run_all_in_graph_and_eager_modes
+@test_util.run_all_without_tensor_float_32(
+    "Uses an LSTMCell, which calls matmul")
 class DropoutWrapperTest(test.TestCase, parameterized.TestCase):
 
   def _testDropoutWrapper(self,

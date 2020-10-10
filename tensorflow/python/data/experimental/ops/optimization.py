@@ -17,32 +17,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from tensorflow.python.compat import compat
 from tensorflow.python.data.ops import dataset_ops
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
 from tensorflow.python.ops import gen_experimental_dataset_ops
-
-
-# TODO(jsimsa): Support RE matching for both individual transformation (e.g. to
-# account for indexing) and transformation sequence.
-def assert_next(transformations):
-  """A transformation that asserts which transformations happen next.
-
-  Args:
-    transformations: A `tf.string` vector `tf.Tensor` identifying the
-      transformations that are expected to happen next.
-
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
-  """
-
-  def _apply_fn(dataset):
-    """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return _AssertNextDataset(dataset, transformations)
-
-  return _apply_fn
 
 
 def model():
@@ -60,28 +36,19 @@ def model():
   return _apply_fn
 
 
-def non_serializable():
-  """A non-serializable identity transformation.
-
-  Returns:
-    A `Dataset` transformation function, which can be passed to
-    `tf.data.Dataset.apply`.
-  """
-
-  def _apply_fn(dataset):
-    """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return _NonSerializableDataset(dataset)
-
-  return _apply_fn
-
-
-def optimize(optimizations=None):
+def optimize(optimizations_enabled=None, optimizations_disabled=None,
+             optimizations_default=None):
   """A transformation that applies optimizations.
 
   Args:
-    optimizations: (Optional.) A `tf.string` vector `tf.Tensor` identifying
-      optimizations to use. If not specified, the default set of optimizations
-      is applied.
+    optimizations_enabled: (Optional.) A `tf.string` vector `tf.Tensor`
+    identifying enabled optimizations. If not specified, set to be empty.
+
+    optimizations_disabled: (Optional.) A `tf.string` vector `tf.Tensor`
+    identifying disabled optimizations. If not specified, set to be empty.
+
+    optimizations_default: (Optional.) A `tf.string` vector `tf.Tensor`
+    identifying default optimizations. If not specified, set to be empty.
 
   Returns:
     A `Dataset` transformation function, which can be passed to
@@ -90,53 +57,13 @@ def optimize(optimizations=None):
 
   def _apply_fn(dataset):
     """Function from `Dataset` to `Dataset` that applies the transformation."""
-    return dataset_ops._OptimizeDataset(dataset, optimizations)  # pylint: disable=protected-access
+    return dataset_ops._OptimizeDataset(  # pylint: disable=protected-access
+        dataset,
+        optimizations_enabled,
+        optimizations_disabled,
+        optimizations_default)
 
   return _apply_fn
-
-
-class _AssertNextDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that asserts which transformations happen next."""
-
-  def __init__(self, input_dataset, transformations):
-    """See `assert_next()` for details."""
-    self._input_dataset = input_dataset
-    if transformations is None:
-      raise ValueError("At least one transformation should be specified")
-    self._transformations = ops.convert_to_tensor(
-        transformations, dtype=dtypes.string, name="transformations")
-    if compat.forward_compatible(2019, 8, 3):
-      variant_tensor = (
-          gen_experimental_dataset_ops.assert_next_dataset(
-              self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-              self._transformations,
-              **self._flat_structure))
-    else:
-      variant_tensor = (
-          gen_experimental_dataset_ops.experimental_assert_next_dataset(
-              self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-              self._transformations,
-              **self._flat_structure))
-    super(_AssertNextDataset, self).__init__(input_dataset, variant_tensor)
-
-
-class _NonSerializableDataset(dataset_ops.UnaryUnchangedStructureDataset):
-  """A `Dataset` that performs non-serializable identity transformation."""
-
-  def __init__(self, input_dataset):
-    """See `non_serializable()` for details."""
-    self._input_dataset = input_dataset
-    if compat.forward_compatible(2019, 8, 3):
-      variant_tensor = (
-          gen_experimental_dataset_ops.non_serializable_dataset(
-              self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-              **self._flat_structure))
-    else:
-      variant_tensor = (
-          gen_experimental_dataset_ops.experimental_non_serializable_dataset(
-              self._input_dataset._variant_tensor,  # pylint: disable=protected-access
-              **self._flat_structure))
-    super(_NonSerializableDataset, self).__init__(input_dataset, variant_tensor)
 
 
 class _ChooseFastestDataset(dataset_ops.DatasetV2):
@@ -171,18 +98,11 @@ class _ChooseFastestDataset(dataset_ops.DatasetV2):
     """
     self._datasets = list(datasets)
     self._element_spec = self._datasets[0].element_spec
-    if compat.forward_compatible(2019, 8, 3):
-      variant_tensor = (
-          gen_experimental_dataset_ops.choose_fastest_dataset(
-              [dataset._variant_tensor for dataset in self._datasets],  # pylint: disable=protected-access
-              num_experiments=num_experiments,
-              **self._flat_structure))
-    else:
-      variant_tensor = (
-          gen_experimental_dataset_ops.experimental_choose_fastest_dataset(
-              [dataset._variant_tensor for dataset in self._datasets],  # pylint: disable=protected-access
-              num_experiments=num_experiments,
-              **self._flat_structure))
+    variant_tensor = (
+        gen_experimental_dataset_ops.choose_fastest_dataset(
+            [dataset._variant_tensor for dataset in self._datasets],  # pylint: disable=protected-access
+            num_experiments=num_experiments,
+            **self._flat_structure))
     super(_ChooseFastestDataset, self).__init__(variant_tensor)
 
   def _inputs(self):
@@ -263,7 +183,7 @@ class _ChooseFastestBranchDataset(dataset_ops.UnaryDataset):
     Returns:
       A `Dataset` that has the same elements the inputs.
     """
-    input_structure = dataset_ops.DatasetStructure(input_dataset.element_spec)
+    input_structure = dataset_ops.DatasetSpec(input_dataset.element_spec)
     self._funcs = [
         dataset_ops.StructuredFunctionWrapper(
             f, "ChooseFastestV2", input_structure=input_structure)

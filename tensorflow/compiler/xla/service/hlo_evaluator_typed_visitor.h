@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/meta/type_traits.h"
 #include "absl/types/optional.h"
 #include "tensorflow/compiler/xla/array2d.h"
+#include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/literal_util.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_evaluator.h"
@@ -41,29 +42,59 @@ namespace xla {
 //
 // Anyway this is relatively safe as-is because hlo_evaluator_typed_visitor.h is
 // a "private" header that's not exposed outside of hlo_evaluator.cc.
+//
+// Not using an alias template to work around MSVC 14.00 bug.
 template <typename T>
-using is_complex_t =
-    absl::disjunction<std::is_same<T, complex64>, std::is_same<T, complex128>>;
+struct is_complex_t : absl::disjunction<std::is_same<T, complex64>,
+                                        std::is_same<T, complex128>> {};
+
+namespace detail {
+template <typename T>
+using unsigned_promoted_type_t =
+    std::make_unsigned_t<decltype(std::declval<T>() + std::declval<T>())>;
+}
 
 // ToArithmeticSafeType(T t):
-//  - converts `t` to the bitwise-equivalent `unsigned T` if T is a signed
+//  - converts `t` to an unsigned integer at least as wide as `int` if T is an
 //    integer, and
 //  - otherwise returns `t` unchanged.
 //
 // It's UB in C++ to under/overflow a signed integer, so we wrap all arithmetic
 // in this type to force 2's complement behavior.
 template <typename T,
-          typename std::enable_if<std::is_integral<T>::value &&
-                                  std::is_signed<T>::value>::type* = nullptr>
-typename std::make_unsigned<T>::type ToArithmeticSafeType(T t) {
-  return static_cast<typename std::make_unsigned<T>::type>(t);
+          typename std::enable_if<std::is_integral<T>::value>::type* = nullptr>
+detail::unsigned_promoted_type_t<T> ToArithmeticSafeType(T t) {
+  return static_cast<detail::unsigned_promoted_type_t<T>>(t);
 }
 template <typename T,
-          typename std::enable_if<!std::is_integral<T>::value ||
-                                  !std::is_signed<T>::value>::type* = nullptr>
+          typename std::enable_if<!std::is_integral<T>::value>::type* = nullptr>
 T ToArithmeticSafeType(T t) {
   return std::move(t);
 }
+
+// UintWithSize<N> gets an unsigned integer with the given size in bytes.
+template <size_t Bytes>
+struct UintWithSize {};
+
+template <>
+struct UintWithSize<1> {
+  using type = uint8;
+};
+
+template <>
+struct UintWithSize<2> {
+  using type = uint16;
+};
+
+template <>
+struct UintWithSize<4> {
+  using type = uint32;
+};
+
+template <>
+struct UintWithSize<8> {
+  using type = uint64;
+};
 
 // Templated DfsHloVisitor for use by HloEvaluator.
 //
@@ -425,6 +456,16 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return HandleNegate<ReturnT>(negate);
   }
 
+  Status HandleLogistic(HloInstruction* logistic) override {
+    TF_ASSIGN_OR_RETURN(
+        parent_->evaluated_[logistic],
+        ElementWiseUnaryOp(logistic, [](ElementwiseT elem_operand) {
+          return static_cast<ElementwiseT>(1) /
+                 (static_cast<ElementwiseT>(1) + std::exp(-elem_operand));
+        }));
+    return Status::OK();
+  }
+
   template <typename NativeT,
             typename std::enable_if<std::is_integral<NativeT>::value>::type* =
                 nullptr>
@@ -672,6 +713,38 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
                           return std::sqrt(elem_operand);
                         }));
     return Status::OK();
+  }
+
+  template <
+      typename NativeT,
+      typename std::enable_if<is_complex_t<NativeT>::value>::type* = nullptr>
+  Status HandleCbrt(HloInstruction* cbrt) {
+    TF_ASSIGN_OR_RETURN(
+        parent_->evaluated_[cbrt],
+        ElementWiseUnaryOp(cbrt, [](ElementwiseT elem_operand) -> ElementwiseT {
+          return std::pow(elem_operand, static_cast<ElementwiseT>(1.0 / 3.0));
+          return elem_operand.real() < 0
+                     ? -std::pow(-elem_operand,
+                                 static_cast<ElementwiseT>(1.0 / 3.0))
+                     : std::pow(elem_operand,
+                                static_cast<ElementwiseT>(1.0 / 3.0));
+        }));
+    return Status::OK();
+  }
+
+  template <
+      typename NativeT,
+      typename std::enable_if<!is_complex_t<NativeT>::value>::type* = nullptr>
+  Status HandleCbrt(HloInstruction* cbrt) {
+    TF_ASSIGN_OR_RETURN(parent_->evaluated_[cbrt],
+                        ElementWiseUnaryOp(cbrt, [](ElementwiseT elem_operand) {
+                          return std::cbrt(elem_operand);
+                        }));
+    return Status::OK();
+  }
+
+  Status HandleCbrt(HloInstruction* cbrt) override {
+    return HandleCbrt<ElementwiseT>(cbrt);
   }
 
   Status HandleRsqrt(HloInstruction* rsqrt) override {
@@ -1008,13 +1081,13 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return Status::OK();
   }
 
-  Status HandleConvolution(HloInstruction* conv) override {
-    auto lhs = conv->operand(0);
-    auto rhs = conv->operand(1);
+  Status HandleConvolutionWithLiterals(HloInstruction* conv,
+                                       const Literal& lhs_literal,
+                                       const Literal& rhs_literal) {
     const auto& window = conv->window();
     const Shape& result_shape = conv->shape();
-    const Shape& lhs_shape = lhs->shape();
-    const Shape& rhs_shape = rhs->shape();
+    const Shape& lhs_shape = lhs_literal.shape();
+    const Shape& rhs_shape = rhs_literal.shape();
 
     TF_CHECK_OK(ShapeUtil::ValidateShape(lhs_shape));
     TF_CHECK_OK(ShapeUtil::ValidateShape(rhs_shape));
@@ -1029,24 +1102,6 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     CHECK_EQ(num_spatial_dims, dnums.kernel_spatial_dimensions_size());
     CHECK_GE(num_spatial_dims, 0);
     CHECK_EQ(window.dimensions_size(), num_spatial_dims);
-
-    const auto lhs_rank = lhs_shape.rank();
-    const auto rhs_rank = rhs_shape.rank();
-
-    CHECK_EQ(num_spatial_dims + 2, lhs_rank);
-    CHECK_EQ(num_spatial_dims + 2, rhs_rank);
-
-    TF_ASSIGN_OR_RETURN(auto inferred_return_shape,
-                        ShapeInference::InferConvolveShape(
-                            lhs_shape, rhs_shape, conv->feature_group_count(),
-                            conv->batch_group_count(), window, dnums));
-    CHECK(ShapeUtil::Compatible(result_shape, inferred_return_shape))
-        << "return shape set to: " << ShapeUtil::HumanString(result_shape)
-        << " but is inferred to be: "
-        << ShapeUtil::HumanString(inferred_return_shape);
-
-    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
-    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
 
     std::vector<int64> window_dimension_sizes;
     for (auto i : dnums.kernel_spatial_dimensions()) {
@@ -1102,7 +1157,10 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
       const int64 feature_group_index =
           out_index[output_z_dim] / output_feature_group_size;
 
-      const int64 batch_group_index = out_index[output_z_dim];
+      const int64 depthwise_multiplier =
+          batch_group_count > 1 ? output_z_size / input_batch_size : 1;
+      const int64 batch_group_index =
+          out_index[output_z_dim] / depthwise_multiplier;
 
       ElementwiseT result_val = static_cast<ElementwiseT>(0);
       DimensionVector rhs_spatial_index(dnums.kernel_spatial_dimensions_size(),
@@ -1163,7 +1221,6 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
               feature_group_index * input_feature_group_size + rhs_iz;
 
           int64 lhs_linear_index = lhs_linear_spatial_index;
-
           lhs_linear_index += out_index[output_batch_dim] *
                               lhs_dim_multipliers[input_batch_dim];
 
@@ -1178,7 +1235,6 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
               lhs_dim_multipliers[input_batch_dim];
 
           lhs_linear_index += iz * lhs_dim_multipliers[input_z_dim];
-
           int64 rhs_linear_index = rhs_linear_spatial_index;
 
           rhs_linear_index += out_index[output_z_dim] *
@@ -1203,9 +1259,68 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return Status::OK();
   }
 
+  Status HandleConvolution(HloInstruction* conv) override {
+    auto lhs = conv->operand(0);
+    auto rhs = conv->operand(1);
+    const auto& window = conv->window();
+    const Shape& result_shape = conv->shape();
+    const Shape& lhs_shape = lhs->shape();
+    const Shape& rhs_shape = rhs->shape();
+
+    TF_CHECK_OK(ShapeUtil::ValidateShape(lhs_shape));
+    TF_CHECK_OK(ShapeUtil::ValidateShape(rhs_shape));
+    CHECK(lhs_shape.IsArray());
+    CHECK(rhs_shape.IsArray());
+
+    const auto& dnums = conv->convolution_dimension_numbers();
+    const int64 num_spatial_dims = dnums.output_spatial_dimensions_size();
+    CHECK_EQ(num_spatial_dims, dnums.input_spatial_dimensions_size());
+    CHECK_EQ(num_spatial_dims, dnums.kernel_spatial_dimensions_size());
+    CHECK_GE(num_spatial_dims, 0);
+    CHECK_EQ(window.dimensions_size(), num_spatial_dims);
+
+    const auto lhs_rank = lhs_shape.rank();
+    const auto rhs_rank = rhs_shape.rank();
+
+    CHECK_EQ(num_spatial_dims + 2, lhs_rank);
+    CHECK_EQ(num_spatial_dims + 2, rhs_rank);
+
+    TF_ASSIGN_OR_RETURN(auto inferred_return_shape,
+                        ShapeInference::InferConvolveShape(
+                            lhs_shape, rhs_shape, conv->feature_group_count(),
+                            conv->batch_group_count(), window, dnums));
+    CHECK(ShapeUtil::Compatible(result_shape, inferred_return_shape))
+        << "return shape set to: " << ShapeUtil::HumanString(result_shape)
+        << " but is inferred to be: "
+        << ShapeUtil::HumanString(inferred_return_shape);
+
+    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
+    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
+    const bool lhs_same = ShapeUtil::SameElementType(lhs_shape, result_shape);
+    const bool rhs_same = ShapeUtil::SameElementType(rhs_shape, result_shape);
+    if (rhs_same && lhs_same) {
+      return HandleConvolutionWithLiterals(conv, lhs_literal, rhs_literal);
+    }
+    if (rhs_same) {
+      return HandleConvolutionWithLiterals(
+          conv, lhs_literal.Convert(result_shape.element_type()).ValueOrDie(),
+          rhs_literal);
+    }
+    if (lhs_same) {
+      return HandleConvolutionWithLiterals(
+          conv, lhs_literal,
+          rhs_literal.Convert(result_shape.element_type()).ValueOrDie());
+    }
+    return HandleConvolutionWithLiterals(
+        conv, lhs_literal.Convert(result_shape.element_type()).ValueOrDie(),
+        rhs_literal.Convert(result_shape.element_type()).ValueOrDie());
+  }
+
   Status HandleDot(HloInstruction* dot) override {
     if (dot->dot_dimension_numbers().rhs_contracting_dimensions_size() == 1 &&
-        parent_->use_fast_path_) {
+        parent_->use_fast_path_ &&
+        ShapeUtil::SameElementType(dot->operand(0)->shape(), dot->shape()) &&
+        ShapeUtil::SameElementType(dot->operand(1)->shape(), dot->shape())) {
       return HandleDot<ReturnT>(dot);
     }
     return HandleDotSlowPath(dot);
@@ -1274,23 +1389,16 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return HandleDotSlowPath(dot);
   }
 
-  Status HandleDotSlowPath(HloInstruction* dot) {
-    auto lhs = dot->operand(0);
-    auto rhs = dot->operand(1);
-    CHECK(dot->shape().IsArray());
-    CHECK(lhs->shape().IsArray());
-    CHECK(rhs->shape().IsArray());
-
+  Status HandleDotSlowPathWithLiterals(HloInstruction* dot,
+                                       const Literal& lhs_literal,
+                                       const Literal& rhs_literal) {
     const auto& dnums = dot->dot_dimension_numbers();
 
-    const auto lhs_rank = lhs->shape().rank();
-    const auto rhs_rank = rhs->shape().rank();
+    const auto lhs_rank = lhs_literal.shape().rank();
+    const auto rhs_rank = rhs_literal.shape().rank();
 
-    CHECK(ShapeUtil::SameElementType(lhs->shape(), rhs->shape()));
-    CHECK(ShapeUtil::SameElementType(lhs->shape(), dot->shape()));
-
-    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
-    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
+    CHECK(ShapeUtil::SameElementType(lhs_literal.shape(), rhs_literal.shape()));
+    CHECK(ShapeUtil::SameElementType(lhs_literal.shape(), dot->shape()));
 
     CHECK_EQ(dnums.lhs_batch_dimensions_size(),
              dnums.rhs_batch_dimensions_size());
@@ -1338,7 +1446,7 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
       const int64 rhs_dnum = dnums.rhs_contracting_dimensions(i);
       accumulate_index_locations.push_back(
           {&lhs_index[lhs_dnum], &rhs_index[rhs_dnum]});
-      const int64 dim_size = lhs->shape().dimensions(lhs_dnum);
+      const int64 dim_size = lhs_literal.shape().dimensions(lhs_dnum);
       accumulate_index_sizes.push_back(dim_size);
     }
     const int64 total_contraction_size = Product(accumulate_index_sizes);
@@ -1363,9 +1471,10 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
               *(accumulate_index_locations[i].second) = accumulate_index[i];
             }
 
+            ElementwiseT lhs_val(lhs_literal.Get<ReturnT>(lhs_index));
+            ElementwiseT rhs_val(rhs_literal.Get<ReturnT>(rhs_index));
             result_val +=
-                static_cast<ElementwiseT>(lhs_literal.Get<ReturnT>(lhs_index)) *
-                static_cast<ElementwiseT>(rhs_literal.Get<ReturnT>(rhs_index));
+                ToArithmeticSafeType(lhs_val) * ToArithmeticSafeType(rhs_val);
 
             // If there are no contracting dimension accumulate_index_sizes is
             // empty, do not try to count down from -1 to 0 since it is and
@@ -1386,6 +1495,36 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
 
     parent_->evaluated_[dot] = std::move(result);
     return Status::OK();
+  }
+
+  Status HandleDotSlowPath(HloInstruction* dot) {
+    auto lhs = dot->operand(0);
+    auto rhs = dot->operand(1);
+    CHECK(dot->shape().IsArray());
+    CHECK(lhs->shape().IsArray());
+    CHECK(rhs->shape().IsArray());
+    const bool lhs_same =
+        ShapeUtil::SameElementType(lhs->shape(), dot->shape());
+    const bool rhs_same =
+        ShapeUtil::SameElementType(rhs->shape(), dot->shape());
+    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
+    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
+    if (lhs_same && rhs_same) {
+      return HandleDotSlowPathWithLiterals(dot, lhs_literal, rhs_literal);
+    }
+    if (lhs_same) {
+      return HandleDotSlowPathWithLiterals(
+          dot, lhs_literal,
+          rhs_literal.Convert(dot->shape().element_type()).ValueOrDie());
+    }
+    if (rhs_same) {
+      return HandleDotSlowPathWithLiterals(
+          dot, lhs_literal.Convert(dot->shape().element_type()).ValueOrDie(),
+          rhs_literal);
+    }
+    return HandleDotSlowPathWithLiterals(
+        dot, lhs_literal.Convert(dot->shape().element_type()).ValueOrDie(),
+        rhs_literal.Convert(dot->shape().element_type()).ValueOrDie());
   }
 
   Status HandlePad(HloInstruction* pad) override {
@@ -1651,6 +1790,10 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
       case F16: {
         TF_ASSIGN_OR_RETURN(parent_->evaluated_[map],
                             MapImpl<Eigen::half>(map));
+        break;
+      }
+      case BF16: {
+        TF_ASSIGN_OR_RETURN(parent_->evaluated_[map], MapImpl<bfloat16>(map));
         break;
       }
       case F32: {
@@ -2009,8 +2152,8 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
       int64 index_vector_dim = dim_numbers_.index_vector_dim();
       for (int64 i = 0, e = index_vector_.size(); i < e; i++) {
         index_vector_index_[index_vector_dim] = i;
-        TF_ASSIGN_OR_RETURN(index_vector_[i], scatter_indices_.GetIntegralAsS64(
-                                                  index_vector_index_));
+        index_vector_[i] =
+            *scatter_indices_.GetIntegralAsS64(index_vector_index_);
       }
       return Status::OK();
     }
@@ -2157,8 +2300,6 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
 
     std::vector<int64> input_index(operand_shape.dimensions_size());
     std::vector<int64> update_index(updates_shape.dimensions_size());
-    std::vector<int64> input_scatter_index_clamped(
-        operand_shape.dimensions_size());
 
     UpdateScatterIndexToInputIndex update_scatter_index_to_input_index(
         &scatter->scatter_dimension_numbers(), /*input_shape=*/operand_shape,
@@ -2271,39 +2412,23 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
   }
 
   // Enable CLZ only for int32, uint32, int64 and uint64.
-  template <
-      typename NativeT,
-      typename std::enable_if<
-          (std::is_floating_point<NativeT>::value ||
-           std::is_integral<NativeT>::value || is_complex_t<NativeT>::value) &&
-          !(std::is_same<NativeT, uint32>::value ||
-            std::is_same<NativeT, int32>::value ||
-            std::is_same<NativeT, int64>::value ||
-            std::is_same<NativeT, uint64>::value)>::type* = nullptr>
+  template <typename NativeT,
+            typename std::enable_if<
+                (!std::is_integral<NativeT>::value ||
+                 std::is_same<NativeT, bool>::value)>::type* = nullptr>
   Status HandleClz(HloInstruction* clz) {
     return UnsupportedTypeError(clz);
   }
 
   template <typename NativeT,
             typename std::enable_if<
-                std::is_same<NativeT, uint32>::value ||
-                std::is_same<NativeT, int32>::value>::type* = nullptr>
+                std::is_integral<NativeT>::value &&
+                !std::is_same<NativeT, bool>::value>::type* = nullptr>
   Status HandleClz(HloInstruction* clz) {
     TF_ASSIGN_OR_RETURN(parent_->evaluated_[clz],
                         ElementWiseUnaryOp(clz, [](ElementwiseT elem_operand) {
-                          return 31 - tensorflow::Log2Floor(elem_operand);
-                        }));
-    return Status::OK();
-  }
-
-  template <typename NativeT,
-            typename std::enable_if<
-                std::is_same<NativeT, uint64>::value ||
-                std::is_same<NativeT, int64>::value>::type* = nullptr>
-  Status HandleClz(HloInstruction* clz) {
-    TF_ASSIGN_OR_RETURN(parent_->evaluated_[clz],
-                        ElementWiseUnaryOp(clz, [](ElementwiseT elem_operand) {
-                          return 63 - tensorflow::Log2Floor64(elem_operand);
+                          return (sizeof(elem_operand) * CHAR_BIT - 1) -
+                                 tensorflow::Log2Floor64(elem_operand);
                         }));
     return Status::OK();
   }
@@ -2312,23 +2437,18 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return HandleClz<ElementwiseT>(clz);
   }
 
-  // Enable Popcnt only for int32, uint32, int64 and uint64.
   template <typename NativeT,
             typename std::enable_if<
-                !(std::is_same<NativeT, uint32>::value ||
-                  std::is_same<NativeT, int32>::value ||
-                  std::is_same<NativeT, uint64>::value ||
-                  std::is_same<NativeT, int64>::value)>::type* = nullptr>
+                (!std::is_integral<NativeT>::value ||
+                 std::is_same<NativeT, bool>::value)>::type* = nullptr>
   Status HandlePopulationCount(HloInstruction* popcnt) {
     return UnsupportedTypeError(popcnt);
   }
 
   template <typename NativeT,
             typename std::enable_if<
-                std::is_same<NativeT, uint32>::value ||
-                std::is_same<NativeT, int32>::value ||
-                std::is_same<NativeT, uint64>::value ||
-                std::is_same<NativeT, int64>::value>::type* = nullptr>
+                std::is_integral<NativeT>::value &&
+                !std::is_same<NativeT, bool>::value>::type* = nullptr>
   Status HandlePopulationCount(HloInstruction* popcnt) {
     TF_ASSIGN_OR_RETURN(
         parent_->evaluated_[popcnt],
@@ -2387,48 +2507,57 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     return HandleCos<ElementwiseT>(cos);
   }
 
-  template <typename NativeT, typename std::enable_if<std::is_same<
-                                  float, NativeT>::value>::type* = nullptr>
+  template <typename NativeT,
+            typename std::enable_if<
+                std::is_same<NativeT, float>::value ||
+                std::is_same<NativeT, double>::value>::type* = nullptr>
   Status HandleReducePrecision(HloInstruction* reduce_precision) {
     TF_ASSIGN_OR_RETURN(
         parent_->evaluated_[reduce_precision],
-        ElementWiseUnaryOp(reduce_precision, [reduce_precision](
-                                                 ElementwiseT elem) {
-          uint32_t value_as_int = absl::bit_cast<uint32_t>(elem);
-          const uint32_t mantissa_bits = reduce_precision->mantissa_bits();
-          const uint32_t exponent_bits = reduce_precision->exponent_bits();
+        ElementWiseUnaryOp(reduce_precision, [&](ElementwiseT elem) {
+          const uint32 src_mantissa_bits =
+              std::numeric_limits<NativeT>::digits - 1;
+          const uint32 src_exponent_bits =
+              8 * sizeof(NativeT) - src_mantissa_bits - 1;
+          const uint32 dest_mantissa_bits = reduce_precision->mantissa_bits();
+          const uint32 dest_exponent_bits = reduce_precision->exponent_bits();
+
+          using Uint = typename UintWithSize<sizeof(NativeT)>::type;
+          Uint value_as_int = absl::bit_cast<Uint>(elem);
 
           // Code is based on the CPU/GPU implementation in LLVM-emitting code.
           //
-          // Bits in float type:
+          // Bits in float32 type:
           //   mantissa : bits [0:22]
           //   exponent : bits [23:30]
           //   sign     : bits [31]
-          if (mantissa_bits < 23) {
-            const uint32_t last_mantissa_bit_mask = 1u << (23 - mantissa_bits);
+          if (dest_mantissa_bits < src_mantissa_bits) {
+            const Uint last_mantissa_bit_mask =
+                Uint{1} << (src_mantissa_bits - dest_mantissa_bits);
 
             // Compute rounding bias for round-to-nearest with ties to even.
             // This is equal to a base value of 0111... plus one bit if the last
             // remaining mantissa bit is 1.
-            const uint32_t base_rounding_bias =
-                (last_mantissa_bit_mask >> 1) - 1;
-            const uint32_t x_last_mantissa_bit =
-                (value_as_int & last_mantissa_bit_mask) >> (23 - mantissa_bits);
-            const uint32_t x_rounding_bias =
+            const Uint base_rounding_bias = (last_mantissa_bit_mask >> 1) - 1;
+            const Uint x_last_mantissa_bit =
+                (value_as_int & last_mantissa_bit_mask) >>
+                (src_mantissa_bits - dest_mantissa_bits);
+            const Uint x_rounding_bias =
                 x_last_mantissa_bit + base_rounding_bias;
 
             // Add rounding bias, and mask out truncated bits.  Note that the
             // case where adding the rounding bias overflows into the exponent
             // bits is correct; the non-masked mantissa bits will all be zero,
             // and the exponent will be incremented by one.
-            const uint32_t truncation_mask = ~(last_mantissa_bit_mask - 1);
+            const Uint truncation_mask = ~(last_mantissa_bit_mask - 1);
             value_as_int = value_as_int + x_rounding_bias;
             value_as_int = value_as_int & truncation_mask;
           }
-          if (exponent_bits < 8) {
+          if (dest_exponent_bits < src_exponent_bits) {
             // Masks for f32 values.
-            const uint32_t f32_sign_bit_mask = 1u << 31;
-            const uint32_t f32_exp_bits_mask = 0xffu << 23;
+            const Uint sign_bit_mask = Uint{1} << 8 * sizeof(NativeT) - 1;
+            const Uint exp_bits_mask = (Uint{1 << src_exponent_bits} - 1)
+                                       << src_mantissa_bits;
 
             // An exponent of 2^(n-1)-1 -- that is, 0111... with the zero in the
             // most- significant bit -- is equal to 1.0f for all exponent sizes.
@@ -2442,23 +2571,24 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
             // is (2^7-1) - 2^(n-1)-1.
             //
             // Note that we have already checked that exponents_bits >= 1.
-            const uint32_t f32_exponent_bias = (1 << 7) - 1;
-            const uint32_t reduced_exponent_bias =
-                (1 << (exponent_bits - 1)) - 1;
-            const uint32_t reduced_max_exponent =
-                f32_exponent_bias + reduced_exponent_bias;
-            const uint32_t reduced_min_exponent =
-                f32_exponent_bias - reduced_exponent_bias;
+            const Uint exponent_bias = (Uint{1} << (src_exponent_bits - 1)) - 1;
+            const Uint reduced_exponent_bias =
+                (1 << (dest_exponent_bits - 1)) - 1;
+            const Uint reduced_max_exponent =
+                exponent_bias + reduced_exponent_bias;
+            const Uint reduced_min_exponent =
+                exponent_bias - reduced_exponent_bias;
 
             // Do we overflow or underflow?
-            const uint32_t x_exponent = value_as_int & f32_exp_bits_mask;
-            const bool x_overflows = x_exponent > (reduced_max_exponent << 23);
+            const Uint x_exponent = value_as_int & exp_bits_mask;
+            const bool x_overflows =
+                x_exponent > (reduced_max_exponent << src_mantissa_bits);
             const bool x_underflows =
-                x_exponent <= (reduced_min_exponent << 23);
+                x_exponent <= (reduced_min_exponent << src_mantissa_bits);
 
             // Compute appropriately-signed values of zero and infinity.
-            const uint32_t x_signed_zero = value_as_int & f32_sign_bit_mask;
-            const uint32_t x_signed_inf = x_signed_zero | f32_exp_bits_mask;
+            const Uint x_signed_zero = value_as_int & sign_bit_mask;
+            const Uint x_signed_inf = x_signed_zero | exp_bits_mask;
 
             // Force to zero or infinity if overflow or underflow.  (Note that
             // this truncates all denormal values to zero, rather than rounding
@@ -2467,21 +2597,15 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
             value_as_int = x_underflows ? x_signed_zero : value_as_int;
           }
 
-          float reduced_result = absl::bit_cast<float>(value_as_int);
+          NativeT reduced_result = absl::bit_cast<NativeT>(value_as_int);
           if (std::isnan(elem)) {
-            reduced_result = mantissa_bits > 0
+            reduced_result = dest_mantissa_bits > 0
                                  ? elem
-                                 : std::numeric_limits<float>::infinity();
+                                 : std::numeric_limits<NativeT>::infinity();
           }
           return reduced_result;
         }));
     return Status::OK();
-  }
-
-  template <typename NativeT, typename std::enable_if<std::is_same<
-                                  double, NativeT>::value>::type* = nullptr>
-  Status HandleReducePrecision(HloInstruction* reduce_precision) {
-    return InvalidArgument("Double is not supported for reduce precision");
   }
 
   template <
@@ -2664,7 +2788,7 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
   // bound, call `f` with the base index.
   static void IterateThroughWindow(
       const Shape& window_shape, const Window& window, const Shape& base_shape,
-      const absl::Span<const int64>& window_count_index,
+      const absl::Span<const int64> window_count_index,
       const std::function<void(const std::vector<int64>&)>& f) {
     const int64 rank = base_shape.rank();
     DimensionVector window_index(rank);

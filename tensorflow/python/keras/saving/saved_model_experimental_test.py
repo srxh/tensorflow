@@ -31,12 +31,13 @@ from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_spec
-from tensorflow.python.framework import test_util
+from tensorflow.python.keras import optimizer_v1
 from tensorflow.python.keras.engine import training as model_lib
 from tensorflow.python.keras.optimizer_v2 import adadelta
+from tensorflow.python.keras.optimizer_v2 import rmsprop
 from tensorflow.python.keras.saving import saved_model_experimental as keras_saved_model
+from tensorflow.python.keras.utils import control_flow_util
 from tensorflow.python.keras.utils import mode_keys
-from tensorflow.python.keras.utils import tf_utils
 from tensorflow.python.ops import array_ops
 from tensorflow.python.platform import test
 from tensorflow.python.saved_model import loader_impl
@@ -44,7 +45,7 @@ from tensorflow.python.saved_model import model_utils
 from tensorflow.python.training import training as training_module
 
 
-class TestModelSavingandLoading(test.TestCase):
+class TestModelSavingandLoading(parameterized.TestCase, test.TestCase):
 
   def _save_model_dir(self, dirname='saved_model'):
     temp_dir = self.get_temp_dir()
@@ -59,7 +60,7 @@ class TestModelSavingandLoading(test.TestCase):
       model.add(keras.layers.TimeDistributed(keras.layers.Dense(3)))
       model.compile(
           loss=keras.losses.MSE,
-          optimizer=keras.optimizers.RMSprop(lr=0.0001),
+          optimizer=rmsprop.RMSprop(lr=0.0001),
           metrics=[keras.metrics.categorical_accuracy],
           sample_weight_mode='temporal')
       x = np.random.random((1, 3))
@@ -75,7 +76,6 @@ class TestModelSavingandLoading(test.TestCase):
       y = loaded_model.predict(x)
       self.assertAllClose(ref_y, y, atol=1e-05)
 
-  @test_util.run_in_graph_and_eager_modes
   def test_saving_sequential_model_without_compile(self):
     with self.cached_session():
       model = keras.models.Sequential()
@@ -102,7 +102,7 @@ class TestModelSavingandLoading(test.TestCase):
       model = keras.models.Model(inputs, output)
       model.compile(
           loss=keras.losses.MSE,
-          optimizer=keras.optimizers.RMSprop(lr=0.0001),
+          optimizer=rmsprop.RMSprop(lr=0.0001),
           metrics=[keras.metrics.categorical_accuracy])
       x = np.random.random((1, 3))
       y = np.random.random((1, 3))
@@ -117,7 +117,6 @@ class TestModelSavingandLoading(test.TestCase):
       y = loaded_model.predict(x)
       self.assertAllClose(ref_y, y, atol=1e-05)
 
-  @test_util.run_in_graph_and_eager_modes
   def test_saving_functional_model_without_compile(self):
     with self.cached_session():
       inputs = keras.layers.Input(shape=(3,))
@@ -138,7 +137,6 @@ class TestModelSavingandLoading(test.TestCase):
       y = loaded_model.predict(x)
       self.assertAllClose(ref_y, y, atol=1e-05)
 
-  @test_util.run_in_graph_and_eager_modes
   def test_saving_with_tf_optimizer(self):
     model = keras.models.Sequential()
     model.add(keras.layers.Dense(2, input_shape=(3,)))
@@ -212,8 +210,8 @@ class LayerWithLearningPhase(keras.engine.base_layer.Layer):
   def call(self, x, training=None):
     if training is None:
       training = keras.backend.learning_phase()
-    output = tf_utils.smart_cond(
-        training, lambda: x * 0, lambda: array_ops.identity(x))
+    output = control_flow_util.smart_cond(training, lambda: x * 0,
+                                          lambda: array_ops.identity(x))
     if not context.executing_eagerly():
       output._uses_learning_phase = True  # pylint: disable=protected-access
     return output
@@ -280,7 +278,6 @@ def load_model(sess, path, mode):
   return inputs, outputs, meta_graph_def
 
 
-@test_util.run_all_in_graph_and_eager_modes
 class TestModelSavedModelExport(test.TestCase, parameterized.TestCase):
 
   def _save_model_dir(self, dirname='saved_model'):
@@ -462,7 +459,7 @@ class TestModelSavedModelExport(test.TestCase, parameterized.TestCase):
       x = keras.layers.Dense(2)(inputs)
       x = keras.layers.Dense(3)(x)
       clone = keras.models.Model(inputs, x)
-      clone.compile(loss='mse', optimizer=keras.optimizers.RMSprop(lr=0.0001))
+      clone.compile(loss='mse', optimizer=optimizer_v1.RMSprop(lr=0.0001))
       clone.train_on_batch(input_arr, target_arr)
 
     keras_saved_model._assert_same_non_optimizer_objects(
@@ -491,18 +488,18 @@ class TestModelSavedModelExport(test.TestCase, parameterized.TestCase):
       x = keras.layers.Dense(4)(x)
       x = keras.layers.Dense(3)(x)
       clone = keras.models.Model(inputs, x)
-      clone.compile(loss='mse', optimizer=keras.optimizers.RMSprop(lr=0.0001))
+      clone.compile(loss='mse', optimizer=optimizer_v1.RMSprop(lr=0.0001))
       clone.train_on_batch(input_arr, target_arr)
 
   def testSaveSequentialModelWithoutInputShapes(self):
     model = sequential_model_without_input_shape(True)
     # A Sequential model that hasn't been built should raise an error.
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         ValueError, 'Weights for sequential model have not yet been created'):
       keras_saved_model.export_saved_model(model, '')
 
     # Even with input_signature, the model's weights has not been created.
-    with self.assertRaisesRegexp(
+    with self.assertRaisesRegex(
         ValueError, 'Weights for sequential model have not yet been created'):
       saved_model_dir = self._save_model_dir()
       keras_saved_model.export_saved_model(

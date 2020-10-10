@@ -30,6 +30,7 @@ from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import control_flow_v2_toggles
 from tensorflow.python.ops import critical_section_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.platform import test
@@ -63,10 +64,12 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
   @parameterized.named_parameters(
       ("Inner%sOuter%s" % (inner, outer), inner, outer)
       for (inner, outer) in itertools.product(*([(False, True)] * 2)))
-  @test_util.disable_control_flow_v2("b/135070612")
   @test_util.run_in_graph_and_eager_modes
   @test_util.xla_allow_fallback("b/128495870")
   def testCriticalSectionWithControlFlow(self, outer_cond, inner_cond):
+    if (not context.executing_eagerly() and
+        control_flow_v2_toggles.control_flow_v2_enabled()):
+      self.skipTest("b/135070612")
     cs = critical_section_ops.CriticalSection(shared_name="cs")
     v = resource_variable_ops.ResourceVariable(0.0, name="v")
     num_concurrent = 100
@@ -167,7 +170,6 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
         [signature.op for signature in
          ops.get_collection(critical_section_ops.CRITICAL_SECTION_EXECUTIONS)])
 
-  @test_util.run_v1_only("b/123955885 Can't identify deadlocks in eager mode")
   def testRecursiveCriticalSectionAccessIsIllegal(self):
     # This does not work properly in eager mode.  Eager users will
     # just hit a deadlock if they do this.  But at least it'll be easier
@@ -177,10 +179,8 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
     def fn(x):
       return cs.execute(lambda: add(x))
 
-    with self.assertRaisesRegexp(
-        ValueError,
-        r"attempts to directly access the CriticalSection in which it "
-        r"would be running"):
+    with self.assertRaisesRegex(
+        ValueError, r"Attempting to lock a CriticalSection in which we are"):
       cs.execute(lambda: fn(1.0))
 
   def testRecursiveCriticalSectionAccessViaCapturedTensorIsProtected(self):
@@ -221,10 +221,10 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
       ex_3 = cs.execute(lambda: fn_captures_dependency(1.0))
 
     # Ensure there's no actual deadlock on to_execute.
-    self.assertEquals(2.0, self.evaluate(ex_0))
-    self.assertEquals(2.0, self.evaluate(ex_1))
-    self.assertEquals(2.0, self.evaluate(ex_2))
-    self.assertEquals(2.0, self.evaluate(ex_3))
+    self.assertEqual(2.0, self.evaluate(ex_0))
+    self.assertEqual(2.0, self.evaluate(ex_1))
+    self.assertEqual(2.0, self.evaluate(ex_2))
+    self.assertEqual(2.0, self.evaluate(ex_3))
 
   def testRecursiveCriticalSectionAccessWithinLoopIsProtected(self):
     cs = critical_section_ops.CriticalSection(shared_name="cs")
@@ -251,7 +251,7 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
         "body_implicit_capture'\n"
         "==============\n")
-    self.assertEquals((1000, 1000), self.evaluate((i_n, j_n)))
+    self.assertEqual((1000, 1000), self.evaluate((i_n, j_n)))
     logging.warn(
         "\n==============\nSuccessfully finished running "
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
@@ -278,7 +278,7 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
         "body_implicit_capture_protected'\n"
         "==============\n")
-    self.assertEquals((1000, 1000), self.evaluate((i_n, j_n)))
+    self.assertEqual((1000, 1000), self.evaluate((i_n, j_n)))
     logging.warn(
         "\n==============\nSuccessfully finished running "
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
@@ -303,14 +303,13 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
         "body_args_capture'\n"
         "==============\n")
-    self.assertEquals((1000, 1000), self.evaluate((i_n, j_n)))
+    self.assertEqual((1000, 1000), self.evaluate((i_n, j_n)))
     logging.warn(
         "\n==============\nSuccessfully finished running "
         "'testRecursiveCriticalSectionAccessWithinLoopDoesNotDeadlock "
         "body_args_capture'\n"
         "==============\n")
 
-  @test_util.run_v1_only("b/123955885 Can't identify deadlocks in eager mode")
   def testRecursiveCriticalSectionAccessIsIllegalSameSharedName(self):
     # This does not work properly in eager mode.  Eager users will
     # just hit a deadlock if they do this.  But at least it'll be easier
@@ -320,13 +319,13 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
     add = lambda x: x + 1
     def fn(x):
       return cs_same.execute(lambda: add(x))
-    with self.assertRaisesRegexp(
-        ValueError,
-        r"attempts to directly access the CriticalSection in which it "
-        r"would be running"):
+
+    with self.assertRaisesRegex(
+        ValueError, r"Attempting to lock a CriticalSection in which we are"):
       cs.execute(lambda: fn(1.0))
 
-  @test_util.run_v1_only("b/123955885 Can't identify deadlocks in eager mode")
+  @test_util.run_v1_only(
+      "b/123955885 Can't identify consumed resources in eager mode")
   def testMultipleCSExecutionsRequestSameResource(self):
     cs0 = critical_section_ops.CriticalSection()
     cs1 = critical_section_ops.CriticalSection()
@@ -336,12 +335,12 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
     cs0.execute(lambda: v - 1)
     # It's *not* OK for a different CriticalSection to access it by
     # default.
-    with self.assertRaisesRegexp(
-        ValueError, "requested exclusive resource access"):
+    with self.assertRaisesRegex(ValueError,
+                                "requested exclusive resource access"):
       cs1.execute(lambda: v + 1)
     # It's not even OK if the second call doesn't request exclusive access.
-    with self.assertRaisesRegexp(
-        ValueError, "requested exclusive resource access"):
+    with self.assertRaisesRegex(ValueError,
+                                "requested exclusive resource access"):
       cs1.execute(lambda: v + 1, exclusive_resource_access=False)
 
     v2 = resource_variable_ops.ResourceVariable(0.0, name="v2")
@@ -349,10 +348,10 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
     # It's OK if neither requests exclusive resource access.
     cs1.execute(lambda: v2 + 1, exclusive_resource_access=False)
 
-    # It's not OK if the second request requires exlusive resource
+    # It's not OK if the second request requires exclusive resource
     # access.
-    with self.assertRaisesRegexp(
-        ValueError, "requested exclusive resource access"):
+    with self.assertRaisesRegex(ValueError,
+                                "requested exclusive resource access"):
       cs1.execute(lambda: v2 + 1)
 
   def testControlDependencyFromOutsideWhileLoopMixedWithInsideLoop(self):
@@ -393,38 +392,12 @@ class CriticalSectionTest(test.TestCase, parameterized.TestCase):
 
     def get_first():
       if context.executing_eagerly():
-        return self.evaluate(ds.make_one_shot_iterator().get_next())
-      itr = ds.make_initializable_iterator()
+        return self.evaluate(dataset_ops.make_one_shot_iterator(ds).get_next())
+      itr = dataset_ops.make_initializable_iterator(ds)
       self.evaluate([v.initializer, itr.initializer])
       return self.evaluate(itr.get_next())
 
     self.assertEqual(1, get_first())
-
-  # TODO(ebrevdo): Re-enable once CriticalSection is in core.
-  #
-  # def testCriticalSectionAndExecuteOpSaverRoundTrip(self):
-  #   cs = critical_section_ops.CriticalSection()
-  #   r = cs.execute(lambda x: x + 1, 1.0)
-  #   graph = ops.get_default_graph()
-  #   meta_graph = saver_lib.export_meta_graph(
-  #       graph=graph, collection_list=graph.get_all_collection_keys())
-  #   graph_copy = ops.Graph()
-  #   with graph_copy.as_default():
-  #     _ = saver_lib.import_meta_graph(meta_graph, import_scope="imported")
-  #     restored_cs = ops.get_collection(critical_section_ops.CRITICAL_SECTIONS)
-  #     restored_exec = ops.get_collection(
-  #         critical_section_ops.CRITICAL_SECTION_EXECUTIONS)
-  #     self.assertEqual(1, len(restored_cs))
-  #     self.assertEqual(1, len(restored_exec))
-  #     self.assertEqual(restored_cs[0].name, "imported/%s" % cs.name)
-  #     self.assertEqual(restored_exec[0].op.name, "imported/%s" % r.op.name)
-
-  # def testToProto(self):
-  #   cs = critical_section_ops.CriticalSection(shared_name="cs")
-  #   proto = cs.to_proto()
-  #   self.assertEqual(proto.critical_section_name, cs._handle.name)
-  #   cs_copy = critical_section_ops.CriticalSection.from_proto(proto)
-  #   self.assertEqual(cs_copy._handle, cs._handle)
 
 
 if __name__ == "__main__":

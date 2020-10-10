@@ -89,15 +89,22 @@ XlaOp DiagonalBlocks(XlaOp a, int64 block_size) {
     // The last block might be smaller than the block size,
     // so we will need to pad it
     if (n % block_size != 0) {
-      // Pad with zeros
+      // Pad with identity matrix.
       auto last_blocks =
           SliceInMinorDims(a, {n - n % block_size, n - n % block_size}, {n, n});
       PaddingConfig config = MakeNoPaddingConfig(ndims);
       int64 padding = block_size - n % block_size;
-      config.mutable_dimensions(ndims - 1)->set_edge_padding_high(padding);
       config.mutable_dimensions(ndims - 2)->set_edge_padding_high(padding);
       last_blocks =
           Pad(last_blocks, Zero(builder, shape.element_type()), config);
+
+      auto eye =
+          IdentityMatrix(builder, shape.element_type(), padding, padding);
+      config = MakeNoPaddingConfig(ndims);
+      config.mutable_dimensions(ndims - 2)->set_edge_padding_low(n %
+                                                                 block_size);
+      eye = Pad(eye, Zero(builder, shape.element_type()), config);
+      last_blocks = ConcatInDim(builder, {last_blocks, eye}, ndims - 1);
 
       // Add a singleton dimension
       // i.e. [..., block_size, block_size] -> [..., 1, block_size, block_size]
@@ -121,9 +128,119 @@ XlaOp DiagonalBlocks(XlaOp a, int64 block_size) {
   });
 }
 
-XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
-                           bool conjugate_a,
-                           PrecisionConfig::Precision precision) {
+XlaOp SolveWithInvertedDiagonalBlocks(XlaOp a, XlaOp b, XlaOp inv_diag_blocks,
+                                      bool left_side, bool lower,
+                                      bool transpose_a, bool conjugate_a,
+                                      PrecisionConfig::Precision precision) {
+  XlaBuilder* builder = a.builder();
+  return builder->ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
+    TF_ASSIGN_OR_RETURN(Shape blocks_shape, builder->GetShape(inv_diag_blocks));
+    TF_ASSIGN_OR_RETURN(Shape b_shape, builder->GetShape(b));
+    int64 block_size = ShapeUtil::GetDimension(blocks_shape, -1);
+
+    TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
+    int64 ndims = a_shape.rank();
+    int64 n = ShapeUtil::GetDimension(a_shape, -1);
+    int64 num_blocks = n / block_size + (n % block_size != 0);
+    int64 m_dim = (left_side) ? -1 : -2;
+    int64 m = ShapeUtil::GetDimension(b_shape, m_dim);
+
+    std::vector<XlaOp> update_ops;
+    int bdims = b_shape.rank();
+    int64 block_dim = (left_side) ? bdims - 2 : bdims - 1;
+
+    // Initialize the solution
+    XlaOp x;
+
+    // This loop is unrolled for performance reasons, but it could be expressed
+    // rolled as well since the matrices are of the same size each iteration
+    for (int i = 0; i < num_blocks; i++) {
+      // High-level intuition: We have B[i] = L[i] @ X. Since L is upper
+      // triangular this means B[i] = L[i, :i + 1] @ X[:i + 1]. We can split
+      // this into two parts: B[i] = L[i, :i] @ X[:i] + L[i, i] @ X[i] which
+      // can be solved for X[i] as X[i] = inv(L[i, i]) @ B[i] - L[i, :i] @ X[:i]
+
+      // Decide whether we go from first block to last or vice versa
+      bool backward = left_side ^ lower ^ transpose_a;
+      auto j = backward ? num_blocks - 1 - i : i;
+
+      // Get the size of the inverse blocks (the last one might be smaller)
+      int64 block = (n % block_size != 0 && j + 1 == num_blocks)
+                        ? n % block_size
+                        : block_size;
+      auto inv_block =
+          MaybeConjugate(Collapse(SliceInMinorDims(inv_diag_blocks, {j, 0, 0},
+                                                   {j + 1, block, block}),
+                                  /*dimensions=*/{ndims - 2, ndims - 1}),
+                         conjugate_a);
+
+      // Get the corresponding row of B
+      int64 k = std::min((j + 1) * block_size, n);
+      std::vector<int64> start = {j * block_size, 0};
+      std::vector<int64> end = {k, m};
+      if (!left_side) {
+        std::swap(start[0], start[1]);
+        std::swap(end[0], end[1]);
+      }
+      auto b_row = SliceInMinorDims(b, start, end);
+
+      XlaOp remainder;
+      if (i == 0) {
+        remainder = b_row;
+      } else {
+        // This matrix multiply get rid of a lot of multiplying with zero
+        // (namely, X[i * block_size:] = 0), L[i, :i] @ X[:i]
+        if (backward) {
+          start = {j * block_size,
+                   std::max(int64{0}, (num_blocks - i) * block_size)};
+          end = {k, n};
+        } else {
+          start = {j * block_size, 0};
+          end = {k, std::min(i * block_size, n)};
+        }
+
+        if (!left_side ^ transpose_a) {
+          std::swap(start[0], start[1]);
+          std::swap(end[0], end[1]);
+        }
+        auto a_row =
+            MaybeConjugate(SliceInMinorDims(a, start, end), conjugate_a);
+        if (left_side) {
+          remainder = b_row - BatchDot(a_row, transpose_a, x, false, precision);
+        } else {
+          remainder = b_row - BatchDot(x, false, a_row, transpose_a, precision);
+        }
+      }
+
+      XlaOp x_update;
+      if (left_side) {
+        x_update =
+            BatchDot(inv_block, transpose_a, remainder, false, precision);
+      } else {
+        x_update =
+            BatchDot(remainder, false, inv_block, transpose_a, precision);
+      }
+
+      if (i == 0) {
+        x = x_update;
+      } else {
+        if (backward) {
+          x = ConcatInDim(builder, {x_update, x}, block_dim);
+        } else {
+          x = ConcatInDim(builder, {x, x_update}, block_dim);
+        }
+      }
+    }
+
+    return x;
+  });
+}
+
+}  // namespace
+
+XlaOp TriangularSolveExpander::InvertDiagonalBlocks(
+    XlaOp diag_blocks, bool lower_triangular,
+    PrecisionConfig::Precision precision) {
   XlaBuilder* builder = diag_blocks.builder();
   return builder->ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     // Input is a batch of square lower triangular square matrices. Its shape is
@@ -136,7 +253,7 @@ XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
 
     // The input must be triangular because we rely on that when doing
     // multiplications later on
-    diag_blocks = Triangle(diag_blocks, /*lower=*/lower);
+    diag_blocks = Triangle(diag_blocks, /*lower=*/lower_triangular);
 
     // Rescale blocks to be unit triangular, but avoid dividing by
     // zero (which can happen if the last block was padded) otherwise it will
@@ -165,7 +282,8 @@ XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
     // The first or last  diagonal element should be set to 1 instead of -1
     // though, since we never update it
     auto pos_one = Reshape(One(builder, shape.element_type()), {1, 1});
-    auto start_index = ConstantR0<int>(builder, (lower) ? 0 : block_size - 1);
+    auto start_index =
+        ConstantR0<int>(builder, lower_triangular ? 0 : block_size - 1);
     auto output_block =
         DynamicUpdateSlice(neg_identity, pos_one,
                            /*start_indices=*/{start_index, start_index});
@@ -212,7 +330,7 @@ XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
       auto body_input = GetTupleElement(input_tuple, 2);
 
       auto zero = ConstantR0<int32>(bodyb.get(), 0);
-      auto j = (lower) ? i : ScalarLike(i, block_size - 1) - i;
+      auto j = lower_triangular ? i : ScalarLike(i, block_size - 1) - i;
       auto input_row =
           DynamicSlice(body_input, {zero, j, zero},
                        /*slice_sizes=*/{num_blocks, 1, block_size});
@@ -239,7 +357,6 @@ XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
     // return while_loop(cond_fun, body_fun, init)[1]
     auto invert_while = While(cond, body, init);
     auto inv_diag_blocks = GetTupleElement(invert_while, 1);
-
     // Undo the scaling
     inv_diag_blocks = Div(inv_diag_blocks, diags,
                           /*broadcast_dimensions=*/{0, 1});
@@ -249,103 +366,10 @@ XlaOp InvertDiagonalBlocks(XlaOp diag_blocks, bool lower, bool transpose_a,
   });
 }
 
-XlaOp SolveWithInvertedDiagonalBlocks(XlaOp a, XlaOp b, XlaOp inv_diag_blocks,
-                                      bool left_side, bool lower,
-                                      bool transpose_a, bool conjugate_a,
-                                      PrecisionConfig::Precision precision) {
-  XlaBuilder* builder = a.builder();
-  return builder->ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
-    TF_ASSIGN_OR_RETURN(Shape blocks_shape, builder->GetShape(inv_diag_blocks));
-    TF_ASSIGN_OR_RETURN(Shape b_shape, builder->GetShape(b));
-    int64 block_size = ShapeUtil::GetDimension(blocks_shape, -1);
-
-    TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
-    int64 ndims = a_shape.rank();
-    int64 n = ShapeUtil::GetDimension(a_shape, -1);
-    int64 num_blocks = n / block_size + (n % block_size != 0);
-    int64 m_dim = (left_side) ? -1 : -2;
-    int64 m = ShapeUtil::GetDimension(b_shape, m_dim);
-
-    // Initialize the solution
-    auto x = ZerosLike(b);
-
-    // This loop is unrolled for performance reasons, but it could be expressed
-    // rolled as well since the matrices are of the same size each iteration
-    for (int i = 0; i < num_blocks; i++) {
-      // High-level intuition: We have B[i] = L[i] @ X. Since L is upper
-      // triangular this means B[i] = L[i, :i + 1] @ X[:i + 1]. We can split
-      // this into two parts: B[i] = L[i, :i] @ X[:i] + L[i, i] @ X[i] which
-      // can be solved for X[i] as X[i] = inv(L[i, i]) @ B[i] - L[i, :i] @ X[:i]
-
-      // Decide whether we go from first block to last or vice versa
-      auto j = (left_side ^ lower ^ transpose_a) ? num_blocks - 1 - i : i;
-
-      // Get the size of the inverse blocks (the last one might be smaller)
-      int64 block = (n % block_size != 0 && j + 1 == num_blocks)
-                        ? n % block_size
-                        : block_size;
-      auto inv_block =
-          MaybeConjugate(Collapse(SliceInMinorDims(inv_diag_blocks, {j, 0, 0},
-                                                   {j + 1, block, block}),
-                                  /*dimensions=*/{ndims - 2, ndims - 1}),
-                         conjugate_a);
-
-      // Get the corresponding row of B
-      int64 k = std::min((j + 1) * block_size, n);
-      std::vector<int64> start = {j * block_size, 0};
-      std::vector<int64> end = {k, m};
-      if (!left_side) {
-        std::swap(start[0], start[1]);
-        std::swap(end[0], end[1]);
-      }
-      auto b_row = SliceInMinorDims(b, start, end);
-
-      XlaOp remainder;
-      if (i == 0) {
-        remainder = b_row;
-      } else {
-        // This matrix multiply involves a lot of multiplying with zero (namely,
-        // X[i * block_size:] = 0), but this is faster than slicing...
-        end = {k, n};
-        if (!left_side) {
-          std::swap(end[0], end[1]);
-        }
-        if (transpose_a) {
-          std::swap(start[0], start[1]);
-          std::swap(end[0], end[1]);
-        }
-        auto a_row =
-            MaybeConjugate(SliceInMinorDims(a, start, end), conjugate_a);
-        if (left_side) {
-          remainder = b_row - BatchDot(a_row, transpose_a, x, false, precision);
-        } else {
-          remainder = b_row - BatchDot(x, false, a_row, transpose_a, precision);
-        }
-      }
-
-      XlaOp x_update;
-      auto zero = Zero(builder, S32);
-      auto start_index = ConstantR0WithType(builder, S32, j * block_size);
-      std::vector<XlaOp> update_starts = {start_index, zero};
-      if (left_side) {
-        x_update =
-            BatchDot(inv_block, transpose_a, remainder, false, precision);
-      } else {
-        x_update =
-            BatchDot(remainder, false, inv_block, transpose_a, precision);
-        std::swap(update_starts[0], update_starts[1]);
-      }
-      x = DynamicUpdateSliceInMinorDims(x, x_update, /*starts=*/update_starts);
-    }
-
-    return x;
-  });
-}
-
-XlaOp BuildTriangularSolve(XlaOp a, XlaOp b, bool left_side, bool lower,
-                           bool transpose_a, bool conjugate_a,
-                           bool unit_diagonal, int64 block_size,
-                           PrecisionConfig::Precision precision) {
+XlaOp TriangularSolveExpander::BuildTriangularSolve(
+    XlaOp a, XlaOp b, bool left_side, bool lower, bool transpose_a,
+    bool conjugate_a, bool unit_diagonal, int64 block_size,
+    PrecisionConfig::Precision precision) {
   XlaBuilder* builder = a.builder();
   return builder->ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(Shape a_shape, builder->GetShape(a));
@@ -407,6 +431,11 @@ XlaOp BuildTriangularSolve(XlaOp a, XlaOp b, bool left_side, bool lower,
       return b;
     }
 
+    // Degenerate case: 1x1 matrices.
+    if (ShapeUtil::GetDimension(a_shape, -1) == 1) {
+      return unit_diagonal ? b : Div(b, MaybeConjugate(a, conjugate_a));
+    }
+
     // TODO(phawkins): consider pushing triangle masking into
     // InvertDiagonalBlocks.
     if (unit_diagonal) {
@@ -425,8 +454,7 @@ XlaOp BuildTriangularSolve(XlaOp a, XlaOp b, bool left_side, bool lower,
     auto diag_blocks = DiagonalBlocks(a, block_size);
 
     // We invert these blocks in parallel using batched matrix-vector products
-    auto inv_diag_blocks = InvertDiagonalBlocks(diag_blocks, lower, transpose_a,
-                                                conjugate_a, precision);
+    auto inv_diag_blocks = InvertDiagonalBlocks(diag_blocks, lower, precision);
 
     // We now find the solution using GEMMs
     auto x =
@@ -437,7 +465,8 @@ XlaOp BuildTriangularSolve(XlaOp a, XlaOp b, bool left_side, bool lower,
   });
 }
 
-}  // namespace
+TriangularSolveExpander::TriangularSolveExpander(int64 block_size)
+    : block_size_(block_size) {}
 
 bool TriangularSolveExpander::InstructionMatchesPattern(
     HloInstruction* instruction) {
@@ -481,7 +510,7 @@ StatusOr<HloInstruction*> TriangularSolveExpander::ExpandInstruction(
 
     BuildTriangularSolve(a, b, options.left_side(), options.lower(),
                          transpose_a, conjugate_a, options.unit_diagonal(),
-                         /*block_size=*/128,
+                         /*block_size=*/block_size_,
                          /*precision=*/PrecisionConfig::HIGHEST);
     TF_ASSIGN_OR_RETURN(XlaComputation xla_computation, builder.Build());
 

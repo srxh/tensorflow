@@ -50,6 +50,7 @@ port::StatusOr<void*> GetRocblasDsoHandle();
 port::StatusOr<void*> GetMiopenDsoHandle();
 port::StatusOr<void*> GetRocfftDsoHandle();
 port::StatusOr<void*> GetRocrandDsoHandle();
+port::StatusOr<void*> GetHipsparseDsoHandle();
 port::StatusOr<void*> GetHipDsoHandle();
 
 // The following method tries to dlopen all necessary GPU libraries for the GPU
@@ -57,6 +58,11 @@ port::StatusOr<void*> GetHipDsoHandle();
 // dynamically loaded. Error status is returned when any of the libraries cannot
 // be dlopened.
 port::Status MaybeTryDlopenGPULibraries();
+
+// The following method tries to dlopen all necessary TensorRT libraries when
+// these libraries should be dynamically loaded. Error status is returned when
+// any of the libraries cannot be dlopened.
+port::Status TryDlopenTensorRTLibraries();
 }  // namespace DsoLoader
 
 // Wrapper around the DsoLoader that prevents us from dlopen'ing any of the DSOs
@@ -77,6 +83,7 @@ port::StatusOr<void*> GetRocblasDsoHandle();
 port::StatusOr<void*> GetMiopenDsoHandle();
 port::StatusOr<void*> GetRocfftDsoHandle();
 port::StatusOr<void*> GetRocrandDsoHandle();
+port::StatusOr<void*> GetHipsparseDsoHandle();
 port::StatusOr<void*> GetHipDsoHandle();
 }  // namespace CachedDsoLoader
 

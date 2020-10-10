@@ -5,8 +5,12 @@ func @main(tensor<4xi1>) -> tensor<4xi1> {
   // CHECK:      {
   // CHECK-NEXT:   version: 3,
   // CHECK-NEXT:   operator_codes: [ {
+  // CHECK-NEXT:     deprecated_builtin_code: 84,
+  // CHECK-NEXT:     version: 1,
   // CHECK-NEXT:     builtin_code: LOGICAL_OR
   // CHECK-NEXT:   }, {
+  // CHECK-NEXT:     deprecated_builtin_code: 86,
+  // CHECK-NEXT:     version: 1,
   // CHECK-NEXT:     builtin_code: LOGICAL_AND
   // CHECK-NEXT:   } ],
   // CHECK-NEXT:   subgraphs: [ {
@@ -14,7 +18,7 @@ func @main(tensor<4xi1>) -> tensor<4xi1> {
   // CHECK-NEXT:       shape: [ 4 ],
   // CHECK-NEXT:       type: BOOL,
   // CHECK-NEXT:       buffer: 1,
-  // CHECK-NEXT:       name: "Input",
+  // CHECK-NEXT:       name: "arg0",
   // CHECK-NEXT:       quantization: {
   // CHECK-EMPTY:
   // CHECK-NEXT:       }
@@ -35,7 +39,7 @@ func @main(tensor<4xi1>) -> tensor<4xi1> {
   // CHECK-EMPTY:
   // CHECK-NEXT:       }
   // CHECK-NEXT:     }, {
-  // CHECK-NEXT:       shape: [  ],
+  // CHECK-NEXT:       shape: [ 4 ],
   // CHECK-NEXT:       type: BOOL,
   // CHECK-NEXT:       buffer: 4,
   // CHECK-NEXT:       name: "logical_or",
@@ -43,7 +47,7 @@ func @main(tensor<4xi1>) -> tensor<4xi1> {
   // CHECK-EMPTY:
   // CHECK-NEXT:       }
   // CHECK-NEXT:     }, {
-  // CHECK-NEXT:       shape: [  ],
+  // CHECK-NEXT:       shape: [ 4 ],
   // CHECK-NEXT:       type: BOOL,
   // CHECK-NEXT:       buffer: 5,
   // CHECK-NEXT:       name: "logical_and",
@@ -76,14 +80,19 @@ func @main(tensor<4xi1>) -> tensor<4xi1> {
   // CHECK-EMPTY:
   // CHECK-NEXT:   }, {
   // CHECK-EMPTY:
+  // CHECK-NEXT:   }, {
+  // CHECK-NEXT:     data: [ 49, 46, 49, 49, 46, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ]
+  // CHECK-NEXT:   } ],
+  // CHECK-NEXT:   metadata: [ {
+  // CHECK-NEXT:   name: "min_runtime_version",
+  // CHECK-NEXT:   buffer: 6
   // CHECK-NEXT:   } ]
   // CHECK-NEXT: }
   // CHECK-EMPTY:
 
-  %0 = "tfl.pseudo_input" (%arg0) : (tensor<4xi1>) -> tensor<4xi1> loc("Input")
-  %1 = "tfl.pseudo_const" () {value = dense<true> : tensor<4xi1>} : () -> tensor<4xi1> loc("Const1")
-  %2 = "tfl.pseudo_const" () {value = dense<false> : tensor<4xi1>} : () -> tensor<4xi1> loc("Const2")
-  %3 = "tfl.logical_or"(%0, %2) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1> loc("logical_or")
-  %4 = "tfl.logical_and"(%3, %1) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1> loc("logical_and")
-  return %4 : tensor<4xi1>
+  %0 = "tfl.pseudo_const" () {value = dense<true> : tensor<4xi1>} : () -> tensor<4xi1> loc("Const1")
+  %1 = "tfl.pseudo_const" () {value = dense<false> : tensor<4xi1>} : () -> tensor<4xi1> loc("Const2")
+  %2 = "tfl.logical_or"(%arg0, %1) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1> loc("logical_or")
+  %3 = "tfl.logical_and"(%2, %0) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1> loc("logical_and")
+  return %3 : tensor<4xi1>
 }

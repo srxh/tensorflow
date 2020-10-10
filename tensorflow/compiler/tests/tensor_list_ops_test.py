@@ -19,6 +19,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import os
+
+from absl.testing import parameterized
 import numpy as np
 from tensorflow.compiler.tests import xla_test
 from tensorflow.python.framework import constant_op
@@ -29,7 +31,7 @@ from tensorflow.python.ops import list_ops
 from tensorflow.python.platform import test
 
 
-class ListOpsTest(xla_test.XLATestCase):
+class ListOpsTest(parameterized.TestCase, xla_test.XLATestCase):
 
   def testElementShape(self):
     with self.session() as sess, self.test_scope():
@@ -101,8 +103,8 @@ class ListOpsTest(xla_test.XLATestCase):
       l = list_ops.tensor_list_push_back(
           l, constant_op.constant(1.0, shape=(7, 15)))
       _, e = list_ops.tensor_list_pop_back(l, element_dtype=dtypes.float32)
-      with self.assertRaisesRegexp(errors.InvalidArgumentError,
-                                   "Set the max number of elements"):
+      with self.assertRaisesRegex(errors.InvalidArgumentError,
+                                  "Set the max number of elements"):
         self.assertAllEqual(sess.run(e), 1.0 * np.ones((7, 15)))
 
   def testEmptyTensorListMax(self):
@@ -172,7 +174,7 @@ class ListOpsTest(xla_test.XLATestCase):
           element_dtype=dtypes.float32, element_shape=None, max_num_elements=2)
       l = list_ops.tensor_list_push_back(l, [3.0, 4.0])
       # Pushing an element with a different shape should raise an error.
-      with self.assertRaisesRegexp(errors.InternalError, "shape"):
+      with self.assertRaisesRegex(errors.InternalError, "shape"):
         l = list_ops.tensor_list_push_back(l, 5.)
         self.evaluate(
             list_ops.tensor_list_stack(l, element_dtype=dtypes.float32))
@@ -204,6 +206,20 @@ class ListOpsTest(xla_test.XLATestCase):
       self.assertAllEqual(t.shape.as_list(), [None])
       self.assertAllEqual(t, [1.0, 2.0])
 
+  @parameterized.named_parameters(
+      ("FlatList", [1.0, 2.0, 3.0], [], [0, 2], [1.0, 3.0]),
+      ("NestedList", [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]
+                     ], [2], [1], [[3.0, 4.0]]),
+      ("EmptyIndices", [1.0, 2.0, 3.0], [], [], []),
+  )
+  def testGather(self, input_list, element_shape, indices, output):
+    with self.session(), self.test_scope():
+      tensor_list = list_ops.tensor_list_from_tensor(
+          input_list, element_shape=element_shape)
+      gather_t = list_ops.tensor_list_gather(
+          tensor_list, indices, element_dtype=dtypes.float32)
+      self.assertAllEqual(gather_t, output)
+
   def testStackWithUninitializedTensors(self):
     with self.session(), self.test_scope():
       l = list_ops.tensor_list_reserve(
@@ -224,6 +240,6 @@ class ListOpsTest(xla_test.XLATestCase):
       self.assertAllEqual(z, [0.0, 0.0])
 
 if __name__ == "__main__":
-  os.environ['TF_XLA_FLAGS'] = ('--tf_xla_min_cluster_size=2 ' +
-                                os.environ.get('TF_XLA_FLAGS', ''))
+  os.environ["TF_XLA_FLAGS"] = ("--tf_xla_min_cluster_size=2 " +
+                                os.environ.get("TF_XLA_FLAGS", ""))
   test.main()

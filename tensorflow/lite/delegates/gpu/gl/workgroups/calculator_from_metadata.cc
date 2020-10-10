@@ -18,16 +18,16 @@ limitations under the License.
 #ifndef TFLITE_GPU_BINARY_RELEASE
 
 #include <memory>
-#include <unordered_map>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/memory/memory.h"
+#include "flatbuffers/flatbuffers.h"  // from @flatbuffers
+#include "tensorflow/lite/delegates/gpu/common/gpu_info.h"
+#include "tensorflow/lite/delegates/gpu/common/types.h"
 #include "tensorflow/lite/delegates/gpu/gl/metadata_generated.h"
 #include "tensorflow/lite/delegates/gpu/gl/workgroups/calculator.h"
 #include "tensorflow/lite/delegates/gpu/gl/workgroups/default_calculator.h"
 #include "tensorflow/lite/delegates/gpu/gl/workgroups_generated.h"
-
-#include "absl/memory/memory.h"
-#include "flatbuffers/flatbuffers.h"  // TF:flatbuffers
-#include "tensorflow/lite/delegates/gpu/common/types.h"
 
 #endif  // TFLITE_GPU_BINARY_RELEASE
 
@@ -62,7 +62,7 @@ class WorkgroupsCalculatorFromMetadata : public WorkgroupsCalculator {
   }
 
  private:
-  std::unordered_map<NodeId, uint3> workgroups_;
+  absl::flat_hash_map<NodeId, uint3> workgroups_;
   std::unique_ptr<WorkgroupsCalculator> default_calculator_;
 };
 

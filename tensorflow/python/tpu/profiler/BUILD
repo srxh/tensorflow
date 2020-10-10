@@ -11,9 +11,8 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":profiler_analysis_pb2_grpc",
-        "//tensorflow/core:protos_all_py",
         "//tensorflow/core/profiler:profiler_analysis_proto_py",
-        "//tensorflow/core/profiler:protos_all_py",
+        "//tensorflow/core/profiler/protobuf:trace_events_proto_py",
         "//tensorflow/python:util",
     ],
 )
@@ -26,11 +25,12 @@ py_library(
     deps = ["//tensorflow/core/profiler:profiler_analysis_proto_py"],
 )
 
-py_binary(
-    name = "capture_tpu_profile",
-    srcs = ["capture_tpu_profile.py"],
-    main = "capture_tpu_profile.py",
-    python_version = "PY2",
+py_library(
+    name = "capture_tpu_profile_lib",
+    srcs = [
+        "capture_tpu_profile.py",
+        "version.py",
+    ],
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/python:client",
@@ -38,8 +38,20 @@ py_binary(
         "//tensorflow/python:platform",
         "//tensorflow/python:versions",
         "//tensorflow/python/distribute/cluster_resolver:cluster_resolver_lib",
-        "//tensorflow/python/eager:profiler_client",
+        "//tensorflow/python/profiler:profiler_client",
+        "//tensorflow/python/profiler:profiler_v2",
         "@absl_py//absl:app",
+        "@absl_py//absl/flags",
+    ],
+)
+
+py_binary(
+    name = "capture_tpu_profile_bin",
+    srcs = ["capture_tpu_profile.py"],
+    main = "capture_tpu_profile.py",
+    python_version = "PY3",
+    deps = [
+        ":capture_tpu_profile_lib",
         "@absl_py//absl/flags",
     ],
 )

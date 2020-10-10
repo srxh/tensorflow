@@ -8,8 +8,8 @@ cc_library(
     srcs = ["calculator.cc"],
     hdrs = ["calculator.h"],
     deps = [
+        "//tensorflow/lite/delegates/gpu/common:gpu_info",
         "//tensorflow/lite/delegates/gpu/common:types",
-        "//tensorflow/lite/delegates/gpu/gl:gpu_info",
         "//tensorflow/lite/delegates/gpu/gl/compiler:shader_code",
     ],
 )
@@ -20,8 +20,8 @@ cc_library(
     hdrs = ["default_calculator.h"],
     deps = [
         ":calculator",
+        "//tensorflow/lite/delegates/gpu/common:gpu_info",
         "//tensorflow/lite/delegates/gpu/common:types",
-        "//tensorflow/lite/delegates/gpu/gl:gpu_info",
     ],
 )
 
@@ -32,15 +32,16 @@ cc_library(
     deps = select({
         "//tensorflow/lite/delegates/gpu:tflite_gpu_binary_release": [],
         "//conditions:default": [
-            ":default_calculator",
-            "//tensorflow/lite/delegates/gpu/gl:common_cc_fbs",
-            "//tensorflow/lite/delegates/gpu/gl:workgroups_cc_fbs",
-            "//tensorflow/lite/delegates/gpu/gl:gpu_info",
-            "//tensorflow/lite/delegates/gpu/gl:metadata_cc_fbs",
             ":calculator",
+            ":default_calculator",
+            "@com_google_absl//absl/container:flat_hash_map",
             "@com_google_absl//absl/memory",
             "@flatbuffers",
+            "//tensorflow/lite/delegates/gpu/common:gpu_info",
             "//tensorflow/lite/delegates/gpu/common:types",
+            "//tensorflow/lite/delegates/gpu/gl:common_cc_fbs",
+            "//tensorflow/lite/delegates/gpu/gl:metadata_cc_fbs",
+            "//tensorflow/lite/delegates/gpu/gl:workgroups_cc_fbs",
         ],
     }),
 )
@@ -52,7 +53,7 @@ cc_library(
     deps = [
         ":calculator",
         ":default_calculator",
-        "//tensorflow/lite/delegates/gpu/gl:gpu_info",
+        "//tensorflow/lite/delegates/gpu/common:gpu_info",
     ] + select({
         "//tensorflow/lite/delegates/gpu:tflite_gpu_binary_release": [],
         "//conditions:default": [
@@ -67,9 +68,9 @@ cc_library(
     hdrs = ["ideal_workgroup_picker.h"],
     deps = [
         ":calculator",
+        "//tensorflow/lite/delegates/gpu/common:gpu_info",
         "//tensorflow/lite/delegates/gpu/common:operations",
         "//tensorflow/lite/delegates/gpu/common:shape",
         "//tensorflow/lite/delegates/gpu/common:types",
-        "//tensorflow/lite/delegates/gpu/gl:gpu_info",
     ],
 )

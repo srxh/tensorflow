@@ -22,8 +22,7 @@ limitations under the License.
 #include <utility>
 #include "tensorflow/core/platform/mutex.h"
 
-#if GOOGLE_CUDA
-#if GOOGLE_TENSORRT
+#if GOOGLE_CUDA && GOOGLE_TENSORRT
 
 #include "third_party/gpus/cuda/include/cuda_runtime_api.h"
 #include "third_party/tensorrt/NvInfer.h"
@@ -34,7 +33,7 @@ namespace tensorrt {
 // TRTs pull model for calibration. When TRT implements a means for
 // a push calibration This class should be updated accordingly
 
-// IInt8EntropyCalibrator2 is prefferred for TRT 5.1+.
+// IInt8EntropyCalibrator2 is preferred for TRT 5.1+.
 #if NV_TENSORRT_MAJOR > 5 || (NV_TENSORRT_MAJOR == 5 && NV_TENSORRT_MINOR >= 1)
 struct TRTInt8Calibrator : public nvinfer1::IInt8EntropyCalibrator2 {
 #else
@@ -89,7 +88,7 @@ struct TRTInt8Calibrator : public nvinfer1::IInt8EntropyCalibrator {
   bool done_;
 
   // Map to keep tensorrt input buffers and sizes keyed with buffer names
-  const std::unordered_map<string, std::pair<void*, size_t>> dev_buffers_;
+  std::unordered_map<string, std::pair<void*, size_t>> dev_buffers_;
 
   bool calib_running_;
   bool batch_is_set_;
@@ -101,6 +100,5 @@ struct TRTInt8Calibrator : public nvinfer1::IInt8EntropyCalibrator {
 }  // namespace tensorrt
 }  // namespace tensorflow
 
-#endif
-#endif
+#endif  // GOOGLE_CUDA && GOOGLE_TENSORRT
 #endif  // TENSORFLOW_COMPILER_TF2TENSORRT_UTILS_TRT_INT8_CALIBRATOR_H_

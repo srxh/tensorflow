@@ -25,7 +25,9 @@ import numpy as np
 
 from tensorflow.compiler.tests import xla_test
 from tensorflow.python.client import device_lib
+from tensorflow.python.compat import compat
 from tensorflow.python.eager import def_function
+from tensorflow.python.framework import config
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors_impl
 from tensorflow.python.framework import ops
@@ -156,6 +158,10 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
   def testNewStateThreeFry(self):
     """Tests that the new state is correct (for ThreeFry).
     """
+    if compat.forward_compatible(2020, 10, 25):
+      self.skipTest("The expected values in this test is inconsistent with "
+                    "CPU/GPU. testXLAEqualsCPU has the correct checks of the "
+                    "new states for the new version.")
     with ops.device(xla_device_name()):
       counter = 57
       key = 0x1234
@@ -171,6 +177,10 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
   def testNewStatePhilox(self):
     """Tests that the new state is correct (for Philox).
     """
+    if compat.forward_compatible(2020, 10, 25):
+      self.skipTest("The expected values in this test is inconsistent with "
+                    "CPU/GPU. testXLAEqualsCPU has the correct checks of the "
+                    "new states for the new version.")
     with ops.device(xla_device_name()):
       counter_low = 57
       counter_high = 283
@@ -204,13 +214,39 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
     """Tests that XLA and CPU kernels generate the same integers."""
     seed = 1234
     shape = [315, 49]
-    with ops.device("/device:CPU:0"):
-      cpu = (random.Generator.from_seed(seed=seed, alg=random.RNG_ALG_PHILOX)
-             .uniform_full_int(shape=shape, dtype=dtype))
-    with ops.device(xla_device_name()):
-      xla = (random.Generator.from_seed(seed=seed, alg=random.RNG_ALG_PHILOX)
-             .uniform_full_int(shape=shape, dtype=dtype))
-    self.assertAllEqual(cpu, xla)
+    if compat.forward_compatible(2020, 10, 25):
+      with ops.device("/device:CPU:0"):
+        cpu_gen = random.Generator.from_seed(
+            seed=seed, alg=random.RNG_ALG_PHILOX)
+      with ops.device(xla_device_name()):
+        xla_gen = random.Generator.from_seed(
+            seed=seed, alg=random.RNG_ALG_PHILOX)
+      # Repeat multiple times to make sure that the state after
+      # number-generation are the same between CPU and XLA.
+      for _ in range(5):
+        with ops.device("/device:CPU:0"):
+          # Test both number-generation and skip
+          cpu = cpu_gen.uniform_full_int(shape=shape, dtype=dtype)
+          cpu_gen.skip(100)
+        with ops.device(xla_device_name()):
+          xla = xla_gen.uniform_full_int(shape=shape, dtype=dtype)
+          xla_gen.skip(100)
+        self.assertAllEqual(cpu, xla)
+        self.assertAllEqual(cpu_gen.state, xla_gen.state)
+    else:
+      # The old version doesn't guarantee that CPU and XLA are in the same state
+      # after number-generation, which is a bug.
+      with ops.device("/device:CPU:0"):
+        cpu = (
+            random.Generator.from_seed(
+                seed=seed, alg=random.RNG_ALG_PHILOX).uniform_full_int(
+                    shape=shape, dtype=dtype))
+      with ops.device(xla_device_name()):
+        xla = (
+            random.Generator.from_seed(
+                seed=seed, alg=random.RNG_ALG_PHILOX).uniform_full_int(
+                    shape=shape, dtype=dtype))
+      self.assertAllEqual(cpu, xla)
 
   def _testRngIsNotConstant(self, rng, dtype):
     # Tests that 'rng' does not always return the same value.
@@ -278,10 +314,11 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
       maxval = 1
       if dtype.is_integer:
         maxval = 100
-      x = gen.uniform(shape=[n], maxval=maxval, dtype=dtype).numpy()
+      t = gen.uniform(shape=[n], maxval=maxval, dtype=dtype)
+      x = t.numpy().astype(float)
       if maxval > 1:
         # Normalize y to range [0, 1).
-        x = x.astype(float) / maxval
+        x = x / maxval
       # Tests that the values are distributed amongst 10 bins with equal
       # probability. 16.92 is the Chi^2 value for 9 degrees of freedom with
       # p=0.05. This test is probabilistic and would be flaky if the random
@@ -327,7 +364,7 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
         gen_stateful_random_ops.stateful_standard_normal_v2(
             gen.state.handle, [0, 0], shape)
       with self.assertRaisesWithPredicateMatch(
-          TypeError, "Requested dtype: int64"):
+          TypeError, "EagerTensor of dtype int64"):
         gen_stateful_random_ops.stateful_standard_normal_v2(
             gen.state.handle, 1.1, shape)
       with self.assertRaisesWithPredicateMatch(
@@ -363,4 +400,5 @@ class StatefulRandomOpsTest(xla_test.XLATestCase, parameterized.TestCase):
 
 if __name__ == "__main__":
   ops.enable_eager_execution()
+  config.set_soft_device_placement(False)
   test.main()

@@ -1,18 +1,11 @@
 licenses(["notice"])  # 3-Clause BSD
 
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
 config_setting(
     name = "build_with_mkl",
     define_values = {
         "build_with_mkl": "true",
-    },
-    visibility = ["//visibility:public"],
-)
-
-config_setting(
-    name = "build_with_mkl_ml_only",
-    define_values = {
-        "build_with_mkl": "true",
-        "build_with_mkl_ml_only": "true",
     },
     visibility = ["//visibility:public"],
 )
@@ -29,17 +22,20 @@ config_setting(
 )
 
 config_setting(
+    name = "build_with_mkl_aarch64",
+    define_values = {
+        "build_with_mkl_aarch64": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
     name = "enable_mkl",
     define_values = {
         "enable_mkl": "true",
         "build_with_mkl": "true",
     },
     visibility = ["//visibility:public"],
-)
-
-load(
-    "//third_party/mkl:build_defs.bzl",
-    "if_mkl",
 )
 
 filegroup(
@@ -77,4 +73,10 @@ cc_library(
         ],
         "//conditions:default": [],
     }),
+)
+
+bzl_library(
+    name = "build_defs_bzl",
+    srcs = ["build_defs.bzl"],
+    visibility = ["//visibility:public"],
 )

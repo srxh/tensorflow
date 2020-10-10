@@ -23,28 +23,13 @@ limitations under the License.
 #include <sstream>
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-#if GOOGLE_CUDA
-#include "third_party/cub/device/device_reduce.cuh"
-#include "third_party/cub/device/device_segmented_reduce.cuh"
-#include "third_party/cub/iterator/counting_input_iterator.cuh"
-#include "third_party/cub/iterator/transform_input_iterator.cuh"
-#include "third_party/cub/warp/warp_reduce.cuh"
-#include "third_party/gpus/cuda/include/cuComplex.h"
-#elif TENSORFLOW_USE_ROCM
-#include "external/rocprim_archive/hipcub/include/hipcub/hipcub.hpp"
-#endif
+#include "tensorflow/core/kernels/gpu_prim.h"
 #include "tensorflow/core/kernels/reduction_ops.h"
 #include "tensorflow/core/lib/core/bits.h"
 #include "tensorflow/core/util/gpu_device_functions.h"
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 #include "tensorflow/core/util/permutation_input_iterator.h"
 #include "tensorflow/core/util/transform_output_iterator.h"
-
-#if GOOGLE_CUDA
-namespace gpuprim = ::cub;
-#elif TENSORFLOW_USE_ROCM
-namespace gpuprim = ::hipcub;
-#endif
 
 namespace tensorflow {
 namespace functor {
@@ -79,13 +64,13 @@ struct Square {
   }
 };
 
-template <typename T, typename outT = T>
+template <typename T, typename OUT_T = T>
 struct DividesBy {
   T divisor;
 
   __host__ __device__ explicit DividesBy(T divisor) : divisor(divisor) {}
 
-  __host__ __device__ outT operator()(const T& x) const { return x / divisor; }
+  __host__ __device__ OUT_T operator()(const T& x) const { return x / divisor; }
 };
 
 #if GOOGLE_CUDA
@@ -161,9 +146,9 @@ struct Or {
 
 // each block does a grid strided loop and reduces its values locally
 // the case of one block is used for low latency small reductions to scalars
-template <typename T, typename outT, int num_threads, typename Op>
-__global__ void BlockReduceKernel(
-    T in, outT out, int num_elems, Op op,
+template <typename T, typename OUT_T, int num_threads, typename Op>
+__global__ __launch_bounds__(1024) void BlockReduceKernel(
+    T in, OUT_T out, int num_elems, Op op,
     typename std::iterator_traits<T>::value_type initVal) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
@@ -198,9 +183,9 @@ __global__ void BlockReduceKernel(
 }
 
 // maps a warp to each row
-template <typename T, typename outT, typename Op>
-__global__ void RowReduceKernel(
-    T in, outT out, int num_rows, int num_cols, Op op,
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void RowReduceKernel(
+    T in, OUT_T out, int num_rows, int num_cols, Op op,
     typename std::iterator_traits<T>::value_type initVal) {
   typedef typename std::iterator_traits<T>::value_type value_type;
   // Defensive index computation to avoid integer overflow.
@@ -266,9 +251,9 @@ struct storage_type<std::complex<T2>> {
 
 // Works only if there are <= 16 columns
 // each warps sums over multiple rows at once
-template <typename T, typename outT, typename Op>
-__global__ void ColumnReduceMax16ColumnsKernel(
-    T in, outT out, int num_rows, int num_cols, Op op,
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void ColumnReduceMax16ColumnsKernel(
+    T in, OUT_T out, int num_rows, int num_cols, Op op,
     typename std::iterator_traits<T>::value_type initVal) {
   typedef typename std::iterator_traits<T>::value_type value_type;
   int rows_per_warp = TF_RED_WARPSIZE / num_cols;
@@ -291,7 +276,7 @@ __global__ void ColumnReduceMax16ColumnsKernel(
     // This is to mimic the following, but without any constructors:
     //   __shared__ storage_type<value_type> partial_sums[TF_RED_WARPSIZE *
     //   (TF_RED_WARPSIZE+1)];
-#if GOOGLE_CUDA || TENSORFLOW_COMPILER_IS_HIP_CLANG
+#if GOOGLE_CUDA
   __shared__ __align__(alignof(value_type)) char
       partial_sums_raw[TF_RED_WARPSIZE * (TF_RED_WARPSIZE + 1) *
                        sizeof(value_type)];
@@ -336,9 +321,9 @@ __global__ void ColumnReduceMax16ColumnsKernel(
 }
 
 // Maps each block to a column range TF_RED_WARPSIZE wide
-template <typename T, typename outT, typename Op>
-__global__ void ColumnReduceKernel(
-    T in, outT out, int num_rows, int num_cols, Op op,
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void ColumnReduceKernel(
+    T in, OUT_T out, int num_rows, int num_cols, Op op,
     typename std::iterator_traits<T>::value_type initVal) {
   typedef typename std::iterator_traits<T>::value_type value_type;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -352,7 +337,7 @@ __global__ void ColumnReduceKernel(
     // This is to mimic the following, but without constructors:
     //     __shared__ storage_type<value_type> partial_sums[TF_RED_WARPSIZE *
     //     (TF_RED_WARPSIZE + 1)];
-#if GOOGLE_CUDA || TENSORFLOW_COMPILER_IS_HIP_CLANG
+#if GOOGLE_CUDA
   __shared__ __align__(alignof(value_type)) char
       partial_sums_raw[TF_RED_WARPSIZE * (TF_RED_WARPSIZE + 1) *
                        sizeof(value_type)];
@@ -402,9 +387,9 @@ __global__ void ColumnReduceKernel(
 // does multiple warp size segmented reductions in parallel
 // segments cannot cross warp boundaries (mainly used for reducing the segments
 // that come from the Max16Columns column reduction kernel)
-template <typename T, typename outT, typename Op>
-__global__ void CleanupSegments(
-    T partial_sums, outT out, int num_rows, int num_cols, int segment_size,
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void CleanupSegments(
+    T partial_sums, OUT_T out, int num_rows, int num_cols, int segment_size,
     Op op, typename std::iterator_traits<T>::value_type initVal) {
   typedef typename std::iterator_traits<T>::value_type value_type;
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -426,9 +411,9 @@ __global__ void CleanupSegments(
 }
 
 // assigns one thread to a column
-template <typename T, typename outT, typename Op>
-__global__ void ColumnReduceSimpleKernel(T in, outT out, int num_planes,
-                                         int num_rows, int num_cols, Op op) {
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void ColumnReduceSimpleKernel(
+    T in, OUT_T out, int num_planes, int num_rows, int num_cols, Op op) {
   typedef typename std::iterator_traits<T>::value_type value_type;
   const int gid = threadIdx.x + blockIdx.x * blockDim.x;
   const int elems_per_plane = num_rows * num_cols;
@@ -450,6 +435,162 @@ __global__ void ColumnReduceSimpleKernel(T in, outT out, int num_planes,
   }
 
   out[plane * num_cols + col] = sum;
+}
+
+namespace {
+constexpr int kUnroll = 8;
+}
+
+template <typename T, typename IN_T, typename Op>
+__device__ __inline__ T ComputeSum(IN_T in_, const int plane,
+                                   const int num_out_rows, int num_rows,
+                                   int num_cols, const int col, Op op) {
+  const int out_rows = num_rows / (2 * kUnroll);
+  const int num_rem_rows = num_rows % (2 * kUnroll);
+  const int elems_per_plane = num_rows * num_cols;
+  T reg[2 * kUnroll];
+  T sum;
+  int offset = 0;
+  if (out_rows != 0) {
+    for (int i = 0; i < 2 * kUnroll; i++) {
+      reg[i] =
+          in_[plane * elems_per_plane + i * (num_out_rows * num_cols) + col];
+    }
+    sum = reg[0];
+    for (int i = 1; i < 2 * kUnroll; i++) {
+      sum = op(sum, reg[i]);
+    }
+    offset = 2 * kUnroll * (num_out_rows * num_cols);
+  }
+
+  if (col < num_cols && num_rem_rows > 0) {
+    reg[0] = in_[plane * elems_per_plane + offset + 0 * num_cols + col];
+    if (out_rows != 0) {
+      sum = op(sum, reg[0]);
+    } else {
+      sum = reg[0];
+    }
+    for (int i = 1; i < num_rem_rows; i++) {
+      reg[0] = in_[plane * elems_per_plane + offset + i * num_cols + col];
+      sum = op(sum, reg[0]);
+    }
+  }
+  return sum;
+}
+
+template <typename IN_T, typename Op>
+__global__ __launch_bounds__(1024) void ColumnReduceInToTempKernel(
+    void* __restrict__ temp, int temp_in_offset, int temp_out_offset, IN_T in,
+    int num_planes, int num_rows, int num_cols, Op op) {
+  typedef typename std::iterator_traits<IN_T>::value_type value_type;
+
+  value_type* t = (value_type*)temp;
+  value_type* out_ = t + temp_out_offset;
+
+  const int gid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int num_out_rows = max(1, num_rows / (2 * kUnroll));
+  const int plane = gid / (num_out_rows * num_cols);
+  const int col = gid % (num_out_rows * num_cols);
+
+  if (plane >= num_planes) return;
+
+  value_type sum;
+  if (temp_in_offset == -1) {
+    auto in_ = in;
+    sum = ComputeSum<value_type, IN_T, Op>(in_, plane, num_out_rows, num_rows,
+                                           num_cols, col, op);
+  } else {
+    auto in_ = t + temp_in_offset;
+    sum = ComputeSum<value_type, value_type*, Op>(in_, plane, num_out_rows,
+                                                  num_rows, num_cols, col, op);
+  }
+  out_[plane * num_out_rows * num_cols + col] = sum;
+}
+
+template <typename T, typename OUT_T, typename Op>
+__global__ __launch_bounds__(1024) void ColumnReduceTempToOutKernel(
+    void* __restrict__ temp, int temp_in_offset, T in, OUT_T out,
+    int num_planes, int num_rows, int num_cols, Op op) {
+  typedef typename std::iterator_traits<T>::value_type value_type;
+  value_type* t = (value_type*)temp;
+  const int tid = threadIdx.x;
+  const int gid = threadIdx.x + blockIdx.x * blockDim.x;
+  int elems_per_plane = num_rows * num_cols;
+
+  if (num_rows == 1) {
+    if (gid >= num_planes * num_cols) return;
+    if (temp_in_offset == -1) {
+      auto in_ = in;
+      out[gid] = in_[gid];
+    } else {
+      auto in_ = t + temp_in_offset;
+      out[gid] = in_[gid];
+    }
+    return;
+  }
+
+  const int planes_per_block = 1;
+  const int plane = blockIdx.x * planes_per_block + tid / elems_per_plane;
+  // A thread block contains one or multiple plane(s),
+  // i.e. num_rows * num_cols <= blockDim.x
+  const int col = tid % elems_per_plane;
+  const int local_plane = plane % planes_per_block;
+
+  if (tid >= planes_per_block * elems_per_plane || plane >= num_planes) return;
+
+  GPU_DYNAMIC_SHARED_MEM_DECL(8, char, ss);
+  value_type* const smem = reinterpret_cast<value_type*>(ss);
+
+  if (temp_in_offset == -1) {
+    auto in_ = in;
+    smem[local_plane * elems_per_plane + col] =
+        in_[plane * elems_per_plane + col];
+  } else {
+    auto in_ = t + temp_in_offset;
+    smem[local_plane * elems_per_plane + col] =
+        in_[plane * elems_per_plane + col];
+  }
+  __syncthreads();
+
+  int num_in_rows = num_rows;
+  int num_out_rows;
+  int num_rem_rows;
+
+  int in_offset = 0;
+  int out_offset = blockDim.x;
+
+  int in_elems_per_plane = elems_per_plane;
+  int out_elems_per_plane;
+
+  while (num_in_rows > 1) {
+    num_out_rows = num_in_rows / 2;
+    num_rem_rows = num_in_rows % 2;
+    out_elems_per_plane = num_out_rows * num_cols;
+
+    if (col < out_elems_per_plane) {
+      value_type sum;
+      sum = op(smem[in_offset + local_plane * in_elems_per_plane + col],
+               smem[in_offset + local_plane * in_elems_per_plane +
+                    out_elems_per_plane + col]);
+      if (num_rem_rows == 1 && col < num_cols) {
+        sum = op(sum, smem[in_offset + local_plane * in_elems_per_plane +
+                           2 * out_elems_per_plane + col]);
+      }
+      smem[out_offset + local_plane * out_elems_per_plane + col] = sum;
+    }
+
+    num_in_rows = num_out_rows;
+    in_elems_per_plane = out_elems_per_plane;
+    int t_offset = in_offset;
+    in_offset = out_offset;
+    out_offset = t_offset;
+    __syncthreads();
+  }
+
+  if (col < num_cols) {
+    out[plane * num_cols + col] =
+        smem[in_offset + local_plane * out_elems_per_plane + col];
+  }
 }
 
 struct RowOffset {
@@ -714,9 +855,9 @@ void LaunchColumnReduction(OpKernelContext* ctx, OUT_T out, IN_T in,
 }
 
 template <typename T, typename Op, typename OUT_T, typename IN_T>
-void Launch3DYReduction(OpKernelContext* ctx, OUT_T out, IN_T in, int extent_x,
-                        int extent_y, int extent_z, Op op, T init,
-                        const gpuStream_t& cu_stream) {
+void Launch3DYReductionSimple(OpKernelContext* ctx, OUT_T out, IN_T in,
+                              int extent_x, int extent_y, int extent_z, Op op,
+                              T init, const gpuStream_t& cu_stream) {
   int threads_per_block = 128;
   int num_blocks =
       (extent_x * extent_z + threads_per_block - 1) / threads_per_block;
@@ -726,6 +867,68 @@ void Launch3DYReduction(OpKernelContext* ctx, OUT_T out, IN_T in, int extent_x,
   TF_CHECK_OK(GpuLaunchKernel(ColumnReduceSimpleKernel<IN_T, OUT_T, Op>,
                               num_blocks, threads_per_block, 0, cu_stream, in,
                               out, extent_x, extent_y, extent_z, op));
+}
+
+template <typename T, typename Op, typename OUT_T, typename IN_T>
+void Launch3DYReduction(OpKernelContext* ctx, OUT_T out, IN_T in, int extent_x,
+                        int extent_y, int extent_z, Op op, T init,
+                        const gpuStream_t& cu_stream) {
+  int threads_per_block = 128;
+
+  int n_group_in = extent_y;
+  int n_size = extent_z;
+
+  // Calculate and allocate temporary space
+  std::size_t temp_storage_bytes = 0;
+  // A plane's size is n_group_in * n_size. We make sure no single plane crosses
+  // more than one thread block, meaning a thread block will handle one whole
+  // plane or multiple planes in the second stage. Also, It may handle a partial
+  // plane when n_size is too large and the while-loop will stop at
+  // n_group_in = 1, where we directly copy the temp to output in the next
+  // stage.
+  while (n_group_in >= 2 && n_group_in * n_size > threads_per_block) {
+    int n_group_out = std::max(1, n_group_in / (2 * kUnroll));
+    temp_storage_bytes += n_group_out * n_size;
+    n_group_in = n_group_out;
+  }
+  temp_storage_bytes *= extent_x * sizeof(T);
+  Tensor temp_storage;
+  OP_REQUIRES_OK(
+      ctx, ctx->allocate_temp(
+               DT_INT8, TensorShape({static_cast<int64>(temp_storage_bytes)}),
+               &temp_storage));
+
+  // Reduction
+  n_group_in = extent_y;
+  int temp_in_offset = -1;
+  int temp_out_offset = 0;
+  int num_blocks;
+  while (n_group_in >= 2 && n_group_in * n_size > threads_per_block) {
+    int n_group_out = std::max(1, n_group_in / (2 * kUnroll));
+    num_blocks =
+        Eigen::divup(extent_x * n_group_out * n_size, threads_per_block);
+    TF_CHECK_OK(GpuLaunchKernel(
+        ColumnReduceInToTempKernel<IN_T, Op>, num_blocks, threads_per_block, 0,
+        cu_stream, (void*)(temp_storage.flat<int8_t>().data()), temp_in_offset,
+        temp_out_offset, in, extent_x, n_group_in, extent_z, op));
+
+    n_group_in = n_group_out;
+    temp_in_offset = temp_out_offset;
+    temp_out_offset = temp_in_offset + extent_x * n_group_out * n_size;
+  }
+
+  if (n_group_in * n_size <= threads_per_block) {
+    num_blocks = extent_x;
+  } else {
+    DCHECK_EQ(1, n_group_in);
+    num_blocks = Eigen::divup(extent_x * n_size, threads_per_block);
+  }
+
+  TF_CHECK_OK(GpuLaunchKernel(
+      ColumnReduceTempToOutKernel<IN_T, OUT_T, Op>, num_blocks,
+      threads_per_block, 2 * sizeof(T) * threads_per_block, cu_stream,
+      (void*)(temp_storage.flat<int8_t>().data()), temp_in_offset, in, out,
+      extent_x, n_group_in, extent_z, op));
 }
 
 template <typename T, typename Op, typename OUT_T, typename IN_T>
@@ -864,8 +1067,14 @@ void ReduceImpl(OpKernelContext* ctx, OUT_T out, IN_T in, int in_rank,
              reduction_axes[0] == 0) {  // column reduction
     LaunchColumnReduction(ctx, out, in, in_dim0, in_dim1, op, init, cu_stream);
   } else if (in_rank == 3 && out_rank == 2 && reduction_axes[0] == 1) {
-    Launch3DYReduction(ctx, out, in, in_dim0, in_dim1, in_dim2, op, init,
-                       cu_stream);
+    int elems_per_thread = in_dim1 / (in_dim0 * in_dim2);
+    if (elems_per_thread >= 16) {
+      Launch3DYReduction(ctx, out, in, in_dim0, in_dim1, in_dim2, op, init,
+                         cu_stream);
+    } else {
+      Launch3DYReductionSimple(ctx, out, in, in_dim0, in_dim1, in_dim2, op,
+                               init, cu_stream);
+    }
   } else if (in_rank == 3 && out_rank == 1 && reduction_axes[0] == 0 &&
              reduction_axes[1] == 2) {
     Launch3DXZReduction(ctx, out, in, in_dim0, in_dim1, in_dim2, op, init,

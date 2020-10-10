@@ -19,15 +19,19 @@ from __future__ import division
 from __future__ import print_function
 import os
 import sys
+
 from absl import app
 from absl import flags
 from distutils.version import LooseVersion
 
 from tensorflow.python.distribute.cluster_resolver import tpu_cluster_resolver as resolver
-from tensorflow.python.eager import profiler_client
+from tensorflow.python.profiler import profiler_client
+from tensorflow.python.profiler import profiler_v2 as profiler
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import versions
+from tensorflow.python.platform import gfile
 from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.tpu.profiler import version as profiler_version
 
 FLAGS = flags.FLAGS
 
@@ -62,9 +66,10 @@ flags.DEFINE_integer('duration_ms', 0,
 flags.DEFINE_integer(
     'num_tracing_attempts', 3, 'Automatically retry N times when no trace '
     'event is collected.')
-flags.DEFINE_boolean('include_dataset_ops', True,
-                     'Set to false to profile longer TPU '
-                     'device traces.')
+flags.DEFINE_boolean('include_dataset_ops', True, 'Deprecated.')
+flags.DEFINE_integer(
+    'host_tracer_level', 2, 'Adjust host tracer level to control the verbosity '
+    ' of the TraceMe event being collected.')
 
 # Monitoring parameters
 flags.DEFINE_integer(
@@ -74,8 +79,7 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'num_queries', 100,
     'This script will run monitoring for num_queries before it stops.')
-flags.DEFINE_boolean('display_timestamp', False,
-                     'Set to true to display timestamp in monitoring results.')
+flags.DEFINE_boolean('display_timestamp', True, 'Deprecated.')
 
 
 def get_workers_list(cluster_resolver):
@@ -108,8 +112,7 @@ def get_workers_list(cluster_resolver):
   return ','.join(workers_list)
 
 
-def monitoring_helper(service_addr, duration_ms, monitoring_level,
-                      display_timestamp, num_queries):
+def monitoring_helper(service_addr, duration_ms, monitoring_level, num_queries):
   """Helper function to print monitoring results.
 
   Helper function to print monitoring results for num_queries times.
@@ -119,15 +122,13 @@ def monitoring_helper(service_addr, duration_ms, monitoring_level,
     duration_ms: Duration of one monitoring sample in milliseconds.
     monitoring_level: An integer between 1 and 2. Level 2 is more verbose than
       level 1 and shows more metrics.
-    display_timestamp: Set to true to display timestamp in monitoring.
     num_queries: Number of monitoring samples to collect.
   """
   if monitoring_level <= 0 or monitoring_level > 2:
     sys.exit('Please choose a monitoring level between 1 and 2.')
 
   for query in range(0, num_queries):
-    res = profiler_client.monitor(service_addr, duration_ms, monitoring_level,
-                                  display_timestamp)
+    res = profiler_client.monitor(service_addr, duration_ms, monitoring_level)
     print('Cloud TPU Monitoring Results (Sample ', query, '):\n\n', res)
 
 
@@ -139,9 +140,10 @@ def main(unused_argv=None):
   logging.set_verbosity(logging.INFO)
   tf_version = versions.__version__
   print('TensorFlow version %s detected' % tf_version)
+  print('Welcome to the Cloud TPU Profiler v%s' % profiler_version.__version__)
 
-  if LooseVersion(tf_version) < LooseVersion('1.14.1'):
-    sys.exit('You must install tensorflow >= 1.14.1 to use this plugin.')
+  if LooseVersion(tf_version) < LooseVersion('2.2.0'):
+    sys.exit('You must install tensorflow >= 2.2.0 to use this plugin.')
 
   if not FLAGS.service_addr and not FLAGS.tpu:
     sys.exit('You must specify either --service_addr or --tpu.')
@@ -153,11 +155,16 @@ def main(unused_argv=None):
                    '--tpu and using --service_addr.')
     service_addr = FLAGS.service_addr
   else:
-    tpu_cluster_resolver = (
-        resolver.TPUClusterResolver([FLAGS.tpu],
-                                    zone=FLAGS.tpu_zone,
-                                    project=FLAGS.gcp_project))
-    service_addr = tpu_cluster_resolver.get_master()
+    try:
+      tpu_cluster_resolver = (
+          resolver.TPUClusterResolver([FLAGS.tpu],
+                                      zone=FLAGS.tpu_zone,
+                                      project=FLAGS.gcp_project))
+      service_addr = tpu_cluster_resolver.get_master()
+    except (ValueError, TypeError):
+      sys.exit('Failed to find TPU %s in zone %s project %s. You may use '
+               '--tpu_zone and --gcp_project to specify the zone and project of'
+               ' your TPU.' % (FLAGS.tpu, FLAGS.tpu_zone, FLAGS.gcp_project))
   service_addr = service_addr.replace('grpc://', '').replace(':8470', ':8466')
 
   workers_list = ''
@@ -175,14 +182,27 @@ def main(unused_argv=None):
           FLAGS.duration_ms, ' ms and show metrics for ', FLAGS.num_queries,
           ' time(s).')
     monitoring_helper(service_addr, duration_ms, FLAGS.monitoring_level,
-                      FLAGS.display_timestamp, FLAGS.num_queries)
+                      FLAGS.num_queries)
   else:
     if not FLAGS.logdir:
-      sys.exit('logdir must be provided')
-    profiler_client.start_tracing(service_addr,
-                                  os.path.expanduser(FLAGS.logdir), duration_ms,
-                                  workers_list, FLAGS.include_dataset_ops,
-                                  FLAGS.num_tracing_attempts)
+      sys.exit('You must specify either --logdir or --monitoring_level.')
+
+    if not gfile.Exists(FLAGS.logdir):
+      gfile.MakeDirs(FLAGS.logdir)
+
+    try:
+      if LooseVersion(tf_version) < LooseVersion('2.3.0'):
+        profiler_client.trace(service_addr, os.path.expanduser(FLAGS.logdir),
+                              duration_ms, workers_list,
+                              FLAGS.num_tracing_attempts)
+      else:
+        options = profiler.ProfilerOptions(
+            host_tracer_level=FLAGS.host_tracer_level)
+        profiler_client.trace(service_addr, os.path.expanduser(FLAGS.logdir),
+                              duration_ms, workers_list,
+                              FLAGS.num_tracing_attempts, options)
+    except errors.UnavailableError:
+      sys.exit(0)
 
 
 if __name__ == '__main__':

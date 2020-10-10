@@ -178,6 +178,10 @@ class InitializersTest(test.TestCase):
 
   @test_util.run_gpu_only
   def testVariablePlacementWithOrthogonalInitializer(self):
+
+    if test.is_built_with_rocm():
+      self.skipTest('Disable subtest on ROCm due to missing QR op support')
+
     with ops.Graph().as_default() as g:
       with ops.device('gpu:0'):
         variable_scope.get_variable(
@@ -199,6 +203,8 @@ class InitializersTest(test.TestCase):
             run_metadata=run_metadata)
 
   @test_util.run_gpu_only
+  @test_util.disable_tfrt('b/165614506: Incorrect device name set in '
+                          'tfrt::TensorHandle.')
   def test_eager_orthogonal_gpu(self):
     with context.eager_mode():
       v = variable_scope.get_variable(
